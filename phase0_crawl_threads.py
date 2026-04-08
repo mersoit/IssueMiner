@@ -24,7 +24,8 @@ import time
 import logging
 import datetime as dt
 import traceback
-from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import requests
@@ -48,8 +49,10 @@ from batch_cleaner import (
 # Config
 # -----------------------------------------------------------
 _REQUEST_TIMEOUT = int(os.getenv("P0_REQUEST_TIMEOUT", "30"))
-_REQUEST_DELAY   = float(os.getenv("P0_REQUEST_DELAY", "0.5"))
+_REQUEST_DELAY   = float(os.getenv("P0_REQUEST_DELAY", "0.05"))   # stagger between submissions
 _MAX_CONTENT_CHARS = int(os.getenv("MAX_CONTENT_CHARS", "12000"))
+_LISTING_WORKERS   = int(os.getenv("P0_LISTING_WORKERS", "4"))    # parallel listing-page fetches
+_QUESTION_WORKERS  = int(os.getenv("P0_QUESTION_WORKERS", "8"))   # parallel question-page fetches
 _USER_AGENT = os.getenv(
     "P0_USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -351,81 +354,82 @@ def crawl_tag_url(
     # -- listing pages --
     all_links: List[Dict[str, str]] = []
     seen: set = set()
-    for pg in range(1, last_page + 1):
-        try:
-            if pg == 1:
-                page_html = first_html
-            else:
-                time.sleep(_REQUEST_DELAY)
-                page_html = _fetch(
-                    _build_page_url(tag_url, pg), sess,
-                )
 
-            links = _extract_question_links(page_html)
-            new_count = 0
-            for lnk in links:
-                if lnk["url"] in seen:
-                    continue
-                seen.add(lnk["url"])
-                qid = _extract_question_id(lnk["url"])
-                if qid in skip:
-                    continue
+    # Page 1 already fetched; collect its links first
+    for lnk in _extract_question_links(first_html):
+        if lnk["url"] not in seen:
+            seen.add(lnk["url"])
+            qid = _extract_question_id(lnk["url"])
+            if qid not in skip:
                 all_links.append(lnk)
-                new_count += 1
-            if pg % 10 == 0 or pg == last_page:
-                logging.info(
-                    "phase0 listing page=%d/%d new=%d total=%d",
-                    pg, last_page, new_count, len(all_links),
-                )
-        except Exception as e:
-            logging.error(
-                "phase0 listing page=%d error: %s", pg, str(e)[:300],
-            )
 
-    logging.info(
-        "phase0 question links to scrape: %d", len(all_links),
-    )
+    # Pages 2..N in parallel
+    if last_page > 1:
+        def _fetch_listing_page(pg: int) -> List[Dict[str, str]]:
+            try:
+                html = _fetch(_build_page_url(tag_url, pg), sess)
+                return _extract_question_links(html)
+            except Exception as e:
+                logging.error("phase0 listing page=%d error: %s", pg, str(e)[:300])
+                return []
 
-    # -- question pages --
-    results: List[Dict[str, Any]] = []
-    for idx, lnk in enumerate(all_links):
+        workers = max(1, min(_LISTING_WORKERS, last_page - 1))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {}
+            for pg in range(2, last_page + 1):
+                futures[ex.submit(_fetch_listing_page, pg)] = pg
+                if _REQUEST_DELAY > 0:
+                    time.sleep(_REQUEST_DELAY)
+            for fut in as_completed(futures):
+                for lnk in fut.result():
+                    if lnk["url"] in seen:
+                        continue
+                    seen.add(lnk["url"])
+                    qid = _extract_question_id(lnk["url"])
+                    if qid not in skip:
+                        all_links.append(lnk)
+
+    logging.info("phase0 question links to scrape: %d", len(all_links))
+
+    # -- question pages (parallel) --
+    def _fetch_question(lnk: Dict[str, str]) -> Optional[Dict[str, Any]]:
         qid = _extract_question_id(lnk["url"])
         if not qid:
-            continue
+            return None
         try:
-            time.sleep(_REQUEST_DELAY)
             q_html = _fetch(lnk["url"], sess)
             detail = _scrape_question_page(q_html, lnk["url"])
             detail["question_id"] = qid
             if not detail.get("title"):
                 detail["title"] = lnk.get("title", "")
-
-            # Use listing-page date if the question page didn't
-            # have one (JSON-LD often omits dateCreated)
             if not detail.get("asked_utc") and lnk.get("asked_date"):
                 detail["asked_utc"] = lnk["asked_date"]
-
-            # Skip questions with empty body (matches Data Factory
-            # delete-nulls step — don't waste downstream processing)
             if not (detail.get("body_raw") or "").strip():
-                logging.debug(
-                    "phase0 skip empty body qid=%s", qid,
-                )
-                continue
-
-            results.append(detail)
+                logging.debug("phase0 skip empty body qid=%s", qid)
+                return None
+            return detail
         except Exception as e:
-            logging.error(
-                "phase0 question %s error: %s", qid, str(e)[:300],
-            )
-        if (idx + 1) % 50 == 0:
-            logging.info(
-                "phase0 scraped %d/%d", idx + 1, len(all_links),
-            )
+            logging.error("phase0 question %s error: %s", qid, str(e)[:300])
+            return None
 
-    logging.info(
-        "phase0 DONE tag=%s scraped=%d", tag_url[:80], len(results),
-    )
+    results: List[Dict[str, Any]] = []
+    workers = max(1, min(_QUESTION_WORKERS, len(all_links)))
+    completed = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {}
+        for lnk in all_links:
+            futures[ex.submit(_fetch_question, lnk)] = lnk
+            if _REQUEST_DELAY > 0:
+                time.sleep(_REQUEST_DELAY)
+        for fut in as_completed(futures):
+            detail = fut.result()
+            if detail:
+                results.append(detail)
+            completed += 1
+            if completed % 50 == 0:
+                logging.info("phase0 scraped %d/%d", completed, len(all_links))
+
+    logging.info("phase0 DONE tag=%s scraped=%d", tag_url[:80], len(results))
     return results
 
 
