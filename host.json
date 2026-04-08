@@ -1,15 +1,30 @@
-{
-  "version": "2.0",
-  "logging": {
-    "applicationInsights": {
-      "samplingSettings": {
-        "isEnabled": true,
-        "excludedTypes": "Request"
-      }
+﻿{
+    "version": "2.0",
+    "extensionBundle": {
+        "id": "Microsoft.Azure.Functions.ExtensionBundle",
+        "version": "[4.*, 5.0.0)"
+    },
+    "functionTimeout": "04:00:00",
+    "extensions": {
+        "http": {
+            "routePrefix": "api",
+            "maxConcurrentRequests": 4,
+            "maxOutstandingRequests": 200
+        }
+    },
+    "logging": {
+        "applicationInsights": {
+            "samplingSettings": {
+                "isEnabled": true,
+                "excludedTypes": "Request"
+            }
+        },
+        "logLevel": {
+            "default": "Information",
+            "Function": "Information",
+            "Host.Results": "Information",
+            "Function.phase4c_populate_scenarios_route": "Debug",
+            "Function.phase4d_populate_topics_route": "Debug"
+        }
     }
-  },
-  "extensionBundle": {
-    "id": "Microsoft.Azure.Functions.ExtensionBundle",
-    "version": "[4.*, 5.0.0)"
-  }
 }

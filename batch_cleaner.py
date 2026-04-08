@@ -1,4 +1,4 @@
-import os
+﻿import os
 import json
 import re
 import hashlib
@@ -235,7 +235,7 @@ def sql_connect() -> pyodbc.Connection:
     return pyodbc.connect(cs)
 
 
-def get_watermark(cnx: pyodbc.Connection, pipeline_name: str) -> Tuple[dt.datetime, int]:
+def get_watermark(cnx: pyodbc.Connection, pipeline_name: str) -> Tuple[dt.datetime, str]:
     cur = cnx.cursor()
     cur.execute(
         "SELECT LastDateCreatedUtc, LastQuestionID FROM dbo.PipelineState WHERE PipelineName=?",
@@ -243,27 +243,27 @@ def get_watermark(cnx: pyodbc.Connection, pipeline_name: str) -> Tuple[dt.dateti
     )
     row = cur.fetchone()
     if not row:
-        return utc_floor_1900(), 0
+        return utc_floor_1900(), ""
 
     last_dt = to_utc_aware(row[0]) or utc_floor_1900()
-    last_qid = int(row[1] or 0)
+    last_qid = str(row[1] or "")
     return last_dt, last_qid
 
 
-def update_watermark(cnx: pyodbc.Connection, pipeline_name: str, last_dt: dt.datetime, last_qid: int, status: str):
+def update_watermark(cnx: pyodbc.Connection, pipeline_name: str, last_dt: dt.datetime, last_qid: str, status: str):
     last_dt = to_utc_aware(last_dt) or utc_floor_1900()
     cur = cnx.cursor()
     cur.execute("""
         UPDATE dbo.PipelineState
         SET LastDateCreatedUtc=?, LastQuestionID=?, LastRunUtc=SYSUTCDATETIME(), Status=?
         WHERE PipelineName=?
-    """, last_dt, int(last_qid), status, pipeline_name)
+    """, last_dt, str(last_qid), status, pipeline_name)
     cnx.commit()
 
 
 def upsert_thread_clean(
     cnx: pyodbc.Connection,
-    qid: int,
+    qid: str,
     created_utc: Optional[dt.datetime],
     asker: Optional[str],
     url: Optional[str],
@@ -328,7 +328,7 @@ def run_batch_clean(req: func.HttpRequest) -> func.HttpResponse:
 
         processed = 0
         newest_dt = utc_floor_1900()
-        newest_qid = 0
+        newest_qid = ""
 
         try:
             with sql_connect() as cnx:
@@ -345,7 +345,7 @@ def run_batch_clean(req: func.HttpRequest) -> func.HttpResponse:
                         df["dateCreated"] = pd.NaT
 
                     if "questionID" not in df.columns:
-                        df["questionID"] = 0
+                        df["questionID"] = ""
 
                     # stable progress
                     try:
@@ -356,8 +356,8 @@ def run_batch_clean(req: func.HttpRequest) -> func.HttpResponse:
                     # incremental filter
                     if not force_full:
                         dt_series = df["dateCreated"].fillna(pd.Timestamp("1900-01-01", tz="UTC"))
-                        qid_series = df["questionID"].fillna(0).astype("int64")
-                        df = df[(dt_series > last_dt_ts) | (qid_series > int(last_qid))]
+                        qid_series = df["questionID"].fillna("").astype(str)
+                        df = df[(dt_series > last_dt_ts) | (qid_series > str(last_qid))]
 
                     for _, row in df.iterrows():
                         if processed >= max_rows:
@@ -374,7 +374,7 @@ def run_batch_clean(req: func.HttpRequest) -> func.HttpResponse:
                                 mimetype="application/json"
                             )
 
-                        qid = int(row.get("questionID", 0) or 0)
+                        qid = str(row.get("questionID", "") or "")
                         url = row.get("URL")
                         asker = row.get("AskerName")
 
@@ -405,7 +405,7 @@ def run_batch_clean(req: func.HttpRequest) -> func.HttpResponse:
                 update_watermark(
                     cnx, pipeline_name,
                     newest_dt if newest_dt.year > 1900 else last_dt,
-                    newest_qid if newest_qid > 0 else last_qid,
+                    newest_qid if newest_qid != "" else last_qid,
                     status
                 )
 
