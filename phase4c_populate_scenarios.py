@@ -185,9 +185,12 @@ def _select_scenario_candidates(
     prod_filter = "AND s.product = ?" if product else ""
     cur = cnx.cursor()
     try:
-        args = [int(limit), int(min_members), float(min_usefulness), int(child_min_members)]
+        # arg order must match SQL placeholder order:
+        # TOP(?), member_count>=?, [product=?], max_solution_usefulness>=?, member_count>=?
+        args: list = [int(limit), int(min_members)]
         if product:
             args.append(product)
+        args += [float(min_usefulness), int(child_min_members)]
         cur.execute(f"""
             SELECT TOP (?)
                 s.cluster_id,

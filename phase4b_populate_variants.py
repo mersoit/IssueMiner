@@ -168,6 +168,7 @@ def _select_variant_candidates(
     limit: int,
     min_members: int = 3,
     min_usefulness: float = 0.4,
+    product: str = "",
 ) -> List[Dict[str, Any]]:
     """
     L3 variants that:
@@ -178,9 +179,14 @@ def _select_variant_candidates(
     Variants whose L4 children have a CommonIssueSolutions playbook are sorted first.
     Safe fallback if WikiPath column doesn't exist yet.
     """
+    product = (product or "").strip()
+    prod_filter = "AND v.product = ?" if product else ""
     cur = cnx.cursor()
     try:
-        cur.execute("""
+        args = [int(limit), float(min_usefulness), int(min_members)]
+        if product:
+            args.append(product)
+        cur.execute(f"""
             SELECT TOP (?)
                 v.cluster_id,
                 v.cluster_level,
@@ -195,6 +201,7 @@ def _select_variant_candidates(
               AND v.WikiPath IS NULL
               AND ISNULL(v.max_solution_usefulness, 0.0) >= ?
               AND ISNULL(v.member_count, 0) >= ?
+              {prod_filter}
             ORDER BY
                 CASE WHEN EXISTS (
                     SELECT 1
@@ -205,7 +212,7 @@ def _select_variant_candidates(
                       AND l.is_active = 1
                 ) THEN 0 ELSE 1 END,
                 v.member_count DESC, v.last_seen_at DESC
-        """, int(limit), float(min_usefulness), int(min_members))
+        """, *args)
     except pyodbc.Error as e:
         if "Invalid column name" in str(e):
             logging.warning(

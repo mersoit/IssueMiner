@@ -741,6 +741,7 @@ def _select_leaf_candidates_for_common(
     limit: int,
     min_max_usefulness: float = 0.6,
     min_members: int = 2,
+    product: str = "",
 ) -> List[int]:
     """
     Leaf KB generation:
@@ -749,8 +750,13 @@ def _select_leaf_candidates_for_common(
       - only if not already in CommonIssueSolutions
     """
     high_usefulness = float(os.getenv("PHASE3_LEAF_HIGH_USEFULNESS", "0.9"))
+    product = (product or "").strip()
+    prod_filter = "AND c.product = ?" if product else ""
     cur = cnx.cursor()
-    cur.execute("""
+    args = [int(limit), int(min_members), float(min_max_usefulness), float(high_usefulness)]
+    if product:
+        args.append(product)
+    cur.execute(f"""
         SELECT TOP (?) c.cluster_id
         FROM dbo.issue_cluster c
         LEFT JOIN dbo.CommonIssueSolutions s ON s.ClusterID = c.cluster_id
@@ -762,8 +768,9 @@ def _select_leaf_candidates_for_common(
               OR
               (ISNULL(c.max_solution_usefulness, 0.0) >= ?)
           )
+          {prod_filter}
         ORDER BY c.max_solution_usefulness DESC, c.member_count DESC, c.last_seen_at DESC
-    """, int(limit), int(min_members), float(min_max_usefulness), float(high_usefulness))
+    """, *args)
     return [int(r[0]) for r in cur.fetchall()]
 
 def _select_variant_candidates_for_common(cnx: pyodbc.Connection, limit: int) -> List[int]:
