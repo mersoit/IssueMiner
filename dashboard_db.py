@@ -153,6 +153,16 @@ IF NOT EXISTS (
 )
 BEGIN
     ALTER TABLE dbo.thread_enrichment ADD batch_id NVARCHAR(64) NULL;
+END
+"""
+
+_BATCH_ID_INDEX_DDL = """
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE object_id = OBJECT_ID('dbo.thread_enrichment')
+      AND name = 'IX_thread_enrichment_batch_id'
+)
+BEGIN
     CREATE INDEX IX_thread_enrichment_batch_id
         ON dbo.thread_enrichment (batch_id)
         WHERE batch_id IS NOT NULL;
@@ -169,7 +179,11 @@ def ensure_tables(cnx: pyodbc.Connection) -> None:
     cur.execute(_KNOWLEDGE_SOURCE_URLS_DDL)
     cur.execute(_PRODUCT_ALIASES_DDL)
     cur.execute(_ENRICHMENT_PRODUCTS_DDL)
+    cnx.commit()
+    # ALTER TABLE must be committed before the index DDL references the new column
     cur.execute(_BATCH_ID_DDL)
+    cnx.commit()
+    cur.execute(_BATCH_ID_INDEX_DDL)
     cnx.commit()
 
 
