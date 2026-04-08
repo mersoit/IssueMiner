@@ -45,6 +45,9 @@ from batch_cleaner import (
     to_utc_aware,
 )
 
+if not logging.root.handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
 # -----------------------------------------------------------
 # Config
 # -----------------------------------------------------------
@@ -696,11 +699,6 @@ def run_phase0_crawl(req) -> Any:
 # -----------------------------------------------------------
 if __name__ == "__main__":
     import argparse
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
 
     parser = argparse.ArgumentParser(
         description="Phase 0: Crawl Microsoft Q&A threads",
