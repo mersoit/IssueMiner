@@ -42,12 +42,14 @@ _MAX_WORKERS = int(os.environ.get("PHASE4_MAX_WORKERS", "20"))
 # SQL helpers
 # -------------------------
 
-def fetch_threads_for_nuggets(cnx, limit: int, product: str = "") -> List[Dict[str, Any]]:
+def fetch_threads_for_nuggets(cnx, limit: int, product: str = "", batch_id: str = "") -> List[Dict[str, Any]]:
     cur = cnx.cursor()
     product = (product or "").strip()
+    batch_filter = "AND t.batch_id = ?" if batch_id else ""
+    batch_args = [batch_id] if batch_id else []
     if product:
         cur.execute(
-            """
+            f"""
             SELECT TOP (?)
                 t.thread_id,
                 t.product,
@@ -62,13 +64,14 @@ def fetch_threads_for_nuggets(cnx, limit: int, product: str = "") -> List[Dict[s
             WHERE t.solution_usefulness >= 0.2
               AND t.NuggetsMinedUtc IS NULL
               AND t.product = ?
+              {batch_filter}
             ORDER BY t.solution_usefulness DESC, t.ingested_at DESC
             """,
-            int(limit), product,
+            int(limit), product, *batch_args,
         )
     else:
         cur.execute(
-            """
+            f"""
             SELECT TOP (?)
                 t.thread_id,
                 t.product,
@@ -84,9 +87,10 @@ def fetch_threads_for_nuggets(cnx, limit: int, product: str = "") -> List[Dict[s
               AND t.NuggetsMinedUtc IS NULL
               AND t.product IS NOT NULL
               AND LTRIM(RTRIM(t.product)) <> ''
+              {batch_filter}
             ORDER BY t.solution_usefulness DESC, t.ingested_at DESC
             """,
-            int(limit),
+            int(limit), *batch_args,
         )
     cols = [c[0] for c in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
@@ -675,6 +679,7 @@ def run_phase4a_nugget_mining(req: func.HttpRequest) -> func.HttpResponse:
         limit = max(1, min(int(req.params.get("limit", "50")), 2000))
         max_workers = max(1, min(int(req.params.get("workers", str(_MAX_WORKERS))), 40))
         product = (req.params.get("product") or "").strip()
+        batch_id = (req.params.get("batch_id") or "").strip()
     except Exception:
         limit = 50
         max_workers = _MAX_WORKERS
@@ -686,7 +691,7 @@ def run_phase4a_nugget_mining(req: func.HttpRequest) -> func.HttpResponse:
         logging.info("Phase4A START: limit=%d max_workers=%d", limit, max_workers)
 
         with _open_sql() as cnx:
-            threads = fetch_threads_for_nuggets(cnx, limit, product=product)
+            threads = fetch_threads_for_nuggets(cnx, limit, product=product, batch_id=batch_id)
 
         logging.info("Phase4A threads fetched: count=%d", len(threads))
 

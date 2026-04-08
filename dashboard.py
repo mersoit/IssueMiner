@@ -59,6 +59,8 @@ from dashboard_db import (
     delete_enrichment_product,
     rename_enrichment_product,
     merge_enrichment_products,
+    create_batch,
+    list_batches,
 )
 
 # Seed list mirrored from phase1a_enricher._SEED_PRODUCTS — used for UI dropdowns
@@ -1086,14 +1088,61 @@ elif page == "⚙️ Pipelines":
 
     st.divider()
 
+    # ── Batch Management ─────────────────────────────────────
+    st.subheader("📦 Batch Management")
+    st.caption(
+        "A batch scopes a set of enriched threads so phases 1B → 4A only process those rows. "
+        "Create a batch below, then use the batch ID in the Demo Run section."
+    )
+
+    with st.container(border=True):
+        try:
+            ep_options = fetch_enrichment_product_names(cnx)
+        except Exception:
+            ep_options = []
+
+        b_col1, b_col2, b_col3 = st.columns([2, 2, 1])
+        with b_col1:
+            batch_product = st.selectbox("Product", ep_options, key="batch_product") if ep_options else st.text_input("Product", key="batch_product_txt")
+        with b_col2:
+            import datetime as _dt
+            default_bid = f"batch_{_dt.datetime.utcnow().strftime('%Y%m%d_%H%M')}"
+            batch_id_input = st.text_input("Batch ID", value=default_bid, key="batch_id_input")
+        with b_col3:
+            batch_limit = st.number_input("Threads", min_value=1, max_value=10000, value=100, step=10, key="batch_limit")
+
+        b_force = st.checkbox("Force (re-stamp already-batched rows)", key="batch_force", value=False)
+        if st.button("📦 Create Batch", key="batch_create_btn", type="primary"):
+            bp = str(batch_product or "").strip()
+            bi = batch_id_input.strip()
+            if not bp or not bi:
+                st.error("Product and Batch ID are required.")
+            else:
+                try:
+                    n = create_batch(get_cnx(), batch_id=bi, product=bp, limit=int(batch_limit), force=b_force)
+                    st.success(f"✅ Stamped **{n}** threads with batch_id=`{bi}` for product **{bp}**.")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Failed: {ex}")
+
+    try:
+        batches = list_batches(cnx)
+        if batches:
+            df_batches = pd.DataFrame(batches)
+            df_batches.columns = ["Batch ID", "Threads", "Products", "Pending 1B", "Pending 2E", "Pending 4A", "Oldest", "Newest"]
+            st.dataframe(df_batches, use_container_width=True, hide_index=True)
+        else:
+            st.info("No batches created yet.")
+    except Exception as e:
+        st.warning(f"Could not load batches: {e}")
+
+    st.divider()
+
     # ── Demo Run: per-product pipeline ──────────────────────
     st.subheader("🧪 Demo Run — Per-Product Pipeline")
-    st.warning(
-        "⚠️ **Demo mode only.** Running on a partial thread set means nuggets, "
-        "catalog nodes and wiki pages will be incomplete. Parent nodes (variant/scenario/topic) "
-        "are generated based only on the children that exist at the time — "
-        "so nodes and cross-links will be missing if not all threads are processed first. "
-        "Run full pipeline for production use."
+    st.caption(
+        "Set a **Batch ID** to scope each phase to that batch's threads only. "
+        "Leave blank to process all eligible threads (full pipeline behaviour)."
     )
 
     try:
@@ -1106,7 +1155,7 @@ elif page == "⚙️ Pipelines":
         st.info("No products registered. Add a product first.")
     else:
         with st.container(border=True):
-            dc1, dc2 = st.columns([2, 1])
+            dc1, dc2, dc3 = st.columns([2, 1, 2])
             with dc1:
                 demo_product = st.selectbox("Product", product_names, key="demo_product")
             with dc2:
@@ -1114,19 +1163,26 @@ elif page == "⚙️ Pipelines":
                     "Thread limit per phase",
                     min_value=1, max_value=500, value=20, step=5,
                     key="demo_limit",
-                    help="How many enriched threads of this product to process in phases 3 & 4A. "
-                         "Phases 4B/4C/4D use cluster limits (same value).",
+                )
+            with dc3:
+                demo_batch_id = st.text_input(
+                    "Batch ID (optional)",
+                    placeholder="e.g. batch_20250601_1400",
+                    key="demo_batch_id",
+                    help="Only threads stamped with this batch_id will be processed by 1B, 1C, 2E, 2F and 4A.",
                 )
 
             _FUNC_BASE = "http://localhost:7071/api"
+            _b = f"&batch_id={demo_batch_id.strip()}" if demo_batch_id.strip() else ""
             demo_phases = [
-                ("Phase 1A – Enrich",         f"{_FUNC_BASE}/phase1a_enrich_batch?limit={demo_limit}&product={demo_product}"),
-                ("Phase 1B – Cluster",         f"{_FUNC_BASE}/phase1b_cluster?product={demo_product}"),
-                ("Phase 2E – Assign leaf",     f"{_FUNC_BASE}/phase2e_assign_leaf?limit={demo_limit}&product={demo_product}"),
+                ("Phase 1B – Cluster",         f"{_FUNC_BASE}/phase1b_cluster?product={demo_product}{_b}"),
+                ("Phase 1C – Emergent cluster", f"{_FUNC_BASE}/phase1c_emergent_cluster?product={demo_product}{_b}"),
+                ("Phase 2E – Assign leaf",     f"{_FUNC_BASE}/phase2e_assign_leaf?limit={demo_limit}&product={demo_product}{_b}"),
+                ("Phase 2F – Emergent detect", f"{_FUNC_BASE}/phase2f_detect_emergent?limit={demo_limit}{_b}"),
                 ("Phase 2G – Count leaves",    f"{_FUNC_BASE}/phase2g_count_leaves?product={demo_product}"),
                 ("Phase 3 – Common playbooks", f"{_FUNC_BASE}/phase3_common?limit={demo_limit}&product={demo_product}"),
                 ("Phase 3 – Push to wiki",     f"{_FUNC_BASE}/phase3_push?limit={demo_limit}"),
-                ("Phase 4A – Nuggets",         f"{_FUNC_BASE}/phase4a_nugget_mining?limit={demo_limit}&product={demo_product}"),
+                ("Phase 4A – Nuggets",         f"{_FUNC_BASE}/phase4a_nugget_mining?limit={demo_limit}&product={demo_product}{_b}"),
                 ("Phase 4B – Variants wiki",   f"{_FUNC_BASE}/phase4b_populate_variants?limit={demo_limit}&product={demo_product}"),
                 ("Phase 4C – Scenarios wiki",  f"{_FUNC_BASE}/phase4c_populate_scenarios?limit={demo_limit}&product={demo_product}"),
                 ("Phase 4D – Topics wiki",     f"{_FUNC_BASE}/phase4d_populate_topics?limit={demo_limit}&product={demo_product}"),

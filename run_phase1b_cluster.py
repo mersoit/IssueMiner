@@ -179,13 +179,20 @@ def _log_db_identity(cnx: pyodbc.Connection) -> None:
     logging.warning("phase1b SQL identity: server=%s db=%s", row[0], row[1])
 
 
-def fetch_next_common_product(cnx: pyodbc.Connection, force: bool, exclude_products: Set[str]) -> Optional[str]:
+def fetch_next_common_product(
+    cnx: pyodbc.Connection,
+    force: bool,
+    exclude_products: Set[str],
+    batch_id: Optional[str] = None,
+) -> Optional[str]:
     """
     Choose the next product to process by looking at the newest eligible row.
     Excluding products prevents the loop from re-picking the same product when force=1
     or when one product dominates the newest rows.
     """
     cur = cnx.cursor()
+    batch_filter = "AND batch_id = ?" if batch_id else ""
+    batch_args = [batch_id] if batch_id else []
 
     if exclude_products:
         placeholders = ",".join("?" for _ in exclude_products)
@@ -199,14 +206,16 @@ def fetch_next_common_product(cnx: pyodbc.Connection, force: bool, exclude_produ
               AND (classification IS NULL OR classification NOT IN ('emergent_issue', 'not_usable', 'learn_microsoft'))
               AND ISNULL(solution_usefulness, 0.0) >= 0.4
               AND product NOT IN ({placeholders})
+              {batch_filter}
             ORDER BY ingested_at DESC, thread_id DESC
             """,
             1 if force else 0,
             *[p for p in exclude_products],
+            *batch_args,
         )
     else:
         cur.execute(
-            """
+            f"""
             SELECT TOP (1) product
             FROM dbo.thread_enrichment
             WHERE (? = 1 OR CatalogCheckedUtc IS NULL)
@@ -214,9 +223,11 @@ def fetch_next_common_product(cnx: pyodbc.Connection, force: bool, exclude_produ
               AND signature_text IS NOT NULL AND LTRIM(RTRIM(signature_text)) <> ''
               AND (classification IS NULL OR classification NOT IN ('emergent_issue', 'not_usable', 'learn_microsoft'))
               AND ISNULL(solution_usefulness, 0.0) >= 0.4
+              {batch_filter}
             ORDER BY ingested_at DESC, thread_id DESC
             """,
             1 if force else 0,
+            *batch_args,
         )
 
     row = cur.fetchone()
@@ -232,6 +243,7 @@ def fetch_unclustered_enrichments(
     cursor_ingested_at: Optional[Any] = None,
     cursor_thread_id: Optional[str] = None,
     product_filter: Optional[str] = None,
+    batch_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Phase 1B: COMMON-ONLY catalog build. Excludes emergent issue threads.
@@ -239,14 +251,17 @@ def fetch_unclustered_enrichments(
     does not re-read the same TOP rows each batch.
 
     If product_filter is provided, the page is homogeneous for that product.
+    If batch_id is provided, only rows stamped with that batch_id are processed.
     """
     cursor = cnx.cursor()
     prod = (product_filter or "").strip() or None
+    batch_filter = "AND batch_id = ?" if batch_id else ""
+    batch_args = [batch_id] if batch_id else []
 
     if cursor_ingested_at is None or cursor_thread_id is None:
         if prod is None:
             cursor.execute(
-                """
+                f"""
                 SELECT TOP (?)
                     thread_id,
                     product,
@@ -264,14 +279,16 @@ def fetch_unclustered_enrichments(
                   AND signature_text IS NOT NULL AND LTRIM(RTRIM(signature_text)) <> ''
                   AND (classification IS NULL OR classification NOT IN ('emergent_issue', 'not_usable', 'learn_microsoft'))
                   AND ISNULL(solution_usefulness, 0.0) >= 0.4
+                  {batch_filter}
                 ORDER BY ingested_at DESC, thread_id DESC
                 """,
                 int(limit),
                 1 if force else 0,
+                *batch_args,
             )
         else:
             cursor.execute(
-                """
+                f"""
                 SELECT TOP (?)
                     thread_id,
                     product,
@@ -289,16 +306,18 @@ def fetch_unclustered_enrichments(
                   AND signature_text IS NOT NULL AND LTRIM(RTRIM(signature_text)) <> ''
                   AND (classification IS NULL OR classification NOT IN ('emergent_issue', 'not_usable', 'learn_microsoft'))
                   AND ISNULL(solution_usefulness, 0.0) >= 0.4
+                  {batch_filter}
                 ORDER BY ingested_at DESC, thread_id DESC
                 """,
                 int(limit),
                 1 if force else 0,
                 prod,
+                *batch_args,
             )
     else:
         if prod is None:
             cursor.execute(
-                """
+                f"""
                 SELECT TOP (?)
                     thread_id,
                     product,
@@ -320,6 +339,7 @@ def fetch_unclustered_enrichments(
                         ingested_at < ?
                      OR (ingested_at = ? AND thread_id < ?)
                   )
+                  {batch_filter}
                 ORDER BY ingested_at DESC, thread_id DESC
                 """,
                 int(limit),
@@ -327,10 +347,11 @@ def fetch_unclustered_enrichments(
                 cursor_ingested_at,
                 cursor_ingested_at,
                 str(cursor_thread_id),
+                *batch_args,
             )
         else:
             cursor.execute(
-                """
+                f"""
                 SELECT TOP (?)
                     thread_id,
                     product,
@@ -352,6 +373,7 @@ def fetch_unclustered_enrichments(
                         ingested_at < ?
                      OR (ingested_at = ? AND thread_id < ?)
                   )
+                  {batch_filter}
                 ORDER BY ingested_at DESC, thread_id DESC
                 """,
                 int(limit),
@@ -360,6 +382,7 @@ def fetch_unclustered_enrichments(
                 cursor_ingested_at,
                 cursor_ingested_at,
                 str(cursor_thread_id),
+                *batch_args,
             )
 
     cols = [c[0] for c in cursor.description]
@@ -1480,6 +1503,7 @@ def run_phase1b_cluster(req: func.HttpRequest) -> func.HttpResponse:
         batch_size = int(req.params.get("batch_size", "10")) # rows per Nano call
         max_batches = int(req.params.get("max_batches", "0"))
         force = req.params.get("force", "0") == "1"
+        batch_id: Optional[str] = (req.params.get("batch_id") or "").strip() or None
 
         slice_limit = int(req.params.get("slice_limit", "800"))
         max_slices = int(req.params.get("max_slices", "4"))
@@ -1526,7 +1550,7 @@ def run_phase1b_cluster(req: func.HttpRequest) -> func.HttpResponse:
                     break
 
                 if chosen_product is None:
-                    chosen_product = fetch_next_common_product(cnx, force, exclude_products=seen_products)
+                    chosen_product = fetch_next_common_product(cnx, force, exclude_products=seen_products, batch_id=batch_id)
                     if not chosen_product:
                         break
                     cursor_ingested_at = None
@@ -1541,6 +1565,7 @@ def run_phase1b_cluster(req: func.HttpRequest) -> func.HttpResponse:
                     cursor_ingested_at=cursor_ingested_at,
                     cursor_thread_id=cursor_thread_id,
                     product_filter=chosen_product,
+                    batch_id=batch_id,
                 )
 
                 if not rows:

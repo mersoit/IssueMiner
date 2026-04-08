@@ -146,6 +146,19 @@ BEGIN
 END
 """
 
+_BATCH_ID_DDL = """
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID('dbo.thread_enrichment') AND name = 'batch_id'
+)
+BEGIN
+    ALTER TABLE dbo.thread_enrichment ADD batch_id NVARCHAR(64) NULL;
+    CREATE INDEX IX_thread_enrichment_batch_id
+        ON dbo.thread_enrichment (batch_id)
+        WHERE batch_id IS NOT NULL;
+END
+"""
+
 
 def ensure_tables(cnx: pyodbc.Connection) -> None:
     cur = cnx.cursor()
@@ -156,7 +169,76 @@ def ensure_tables(cnx: pyodbc.Connection) -> None:
     cur.execute(_KNOWLEDGE_SOURCE_URLS_DDL)
     cur.execute(_PRODUCT_ALIASES_DDL)
     cur.execute(_ENRICHMENT_PRODUCTS_DDL)
+    cur.execute(_BATCH_ID_DDL)
     cnx.commit()
+
+
+# ─────────────────────────────────────────────────────────
+# Batch management
+# ─────────────────────────────────────────────────────────
+
+def create_batch(
+    cnx: pyodbc.Connection,
+    batch_id: str,
+    product: str,
+    limit: int,
+    force: bool = False,
+) -> int:
+    """Stamp batch_id onto up to `limit` eligible thread_enrichment rows for `product`.
+
+    Eligible = CatalogCheckedUtc IS NULL (unprocessed by 1B onward).
+    If force=True, also stamps rows that already have a different batch_id
+    (allows re-scoping) but never touches rows already stamped with this batch_id.
+    Returns the number of rows stamped.
+    """
+    batch_id = (batch_id or "").strip()
+    product  = (product  or "").strip()
+    if not batch_id or not product:
+        raise ValueError("batch_id and product are required")
+
+    cur = cnx.cursor()
+    if force:
+        cur.execute("""
+            UPDATE TOP (?) dbo.thread_enrichment
+            SET batch_id = ?
+            WHERE product = ?
+              AND (batch_id IS NULL OR batch_id <> ?)
+              AND product IS NOT NULL AND LTRIM(RTRIM(product)) <> ''
+        """, int(limit), batch_id, product, batch_id)
+    else:
+        cur.execute("""
+            UPDATE TOP (?) dbo.thread_enrichment
+            SET batch_id = ?
+            WHERE product = ?
+              AND batch_id IS NULL
+              AND CatalogCheckedUtc IS NULL
+              AND product IS NOT NULL AND LTRIM(RTRIM(product)) <> ''
+        """, int(limit), batch_id, product)
+    stamped = cur.rowcount
+    cnx.commit()
+    return int(stamped)
+
+
+def list_batches(cnx: pyodbc.Connection) -> List[Dict[str, Any]]:
+    """Summary of all batch_ids currently stamped in thread_enrichment."""
+    cur = cnx.cursor()
+    cur.execute("""
+        SELECT
+            batch_id,
+            COUNT(*)                                                        AS total_threads,
+            COUNT(DISTINCT product)                                         AS products,
+            SUM(CASE WHEN CatalogCheckedUtc  IS NULL THEN 1 ELSE 0 END)    AS pending_1b,
+            SUM(CASE WHEN AssignmentCompletedUtc IS NULL THEN 1 ELSE 0 END) AS pending_2e,
+            SUM(CASE WHEN NuggetsMinedUtc    IS NULL THEN 1 ELSE 0 END)    AS pending_4a,
+            MIN(ingested_at)                                                AS oldest,
+            MAX(ingested_at)                                                AS newest
+        FROM dbo.thread_enrichment
+        WHERE batch_id IS NOT NULL
+        GROUP BY batch_id
+        ORDER BY MAX(ingested_at) DESC
+    """)
+    cols = [c[0] for c in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
 # ─────────────────────────────────────────────────────────

@@ -84,10 +84,14 @@ def force_reset_threads_for_emergent(cnx: pyodbc.Connection, max_rows: int) -> i
 def claim_threads_for_emergent(
     cnx: pyodbc.Connection,
     batch_size: int,
-    include_completed: bool
+    include_completed: bool,
+    batch_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     cur = cnx.cursor()
-    cur.execute("""
+    batch_filter = "AND batch_id = ?" if batch_id else ""
+    batch_args = [batch_id] if batch_id else []
+    cur.execute(
+        f"""
         ;WITH cte AS (
             SELECT TOP (?)
                 thread_id
@@ -99,6 +103,7 @@ def claim_threads_for_emergent(
               AND ISNULL(emergent_signal, 0.0) >= 0.5
               AND (? = 1 OR EmergentCompletedUtc IS NULL)
               AND EmergentStartedUtc IS NULL
+              {batch_filter}
             ORDER BY CatalogCheckedUtc DESC, ingested_at DESC
         )
         UPDATE te
@@ -112,7 +117,7 @@ def claim_threads_for_emergent(
                INSERTED.CatalogCheckedUtc
         FROM dbo.thread_enrichment te
         JOIN cte ON cte.thread_id = te.thread_id;
-    """, int(batch_size), 1 if include_completed else 0)
+    """, int(batch_size), 1 if include_completed else 0, *batch_args)
 
     cols = [c[0] for c in cur.description]
     return [dict(zip(cols, row)) for row in cur.fetchall()]
@@ -505,6 +510,7 @@ def run_phase2f_detect_emergent(req: func.HttpRequest) -> func.HttpResponse:
         max_batches = int(req.params.get("max_batches", "10"))
         max_workers = int(req.params.get("max_workers", "2"))
         force = (req.params.get("force", "0") == "1")
+        batch_id: Optional[str] = (req.params.get("batch_id") or "").strip() or None
 
         stale_claim_minutes = int(req.params.get("stale_claim_minutes", "60"))
         reset_rows_override = req.params.get("reset_rows")
@@ -551,7 +557,7 @@ def run_phase2f_detect_emergent(req: func.HttpRequest) -> func.HttpResponse:
                             all_results.append({"status": "worker_failed", "error": str(e)})
 
                 with sql_connect() as cnx:
-                    threads = claim_threads_for_emergent(cnx, batch_size=batch_size, include_completed=include_completed)
+                    threads = claim_threads_for_emergent(cnx, batch_size=batch_size, include_completed=include_completed, batch_id=batch_id)
                     cnx.commit()
 
                 if not threads:

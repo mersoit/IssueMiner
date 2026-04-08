@@ -158,10 +158,12 @@ def make_aoai_client() -> AzureOpenAI:
 # SQL
 # ---------------------------------------------------------
 
-def fetch_emergent_threads(cnx: pyodbc.Connection, limit: int, force: bool) -> List[Dict[str, Any]]:
+def fetch_emergent_threads(cnx: pyodbc.Connection, limit: int, force: bool, batch_id: Optional[str] = None) -> List[Dict[str, Any]]:
     cur = cnx.cursor()
+    batch_filter = "AND batch_id = ?" if batch_id else ""
+    batch_args = [batch_id] if batch_id else []
     cur.execute(
-        """
+        f"""
         SELECT TOP (?)
             thread_id,
             product,
@@ -178,10 +180,12 @@ def fetch_emergent_threads(cnx: pyodbc.Connection, limit: int, force: bool) -> L
           AND product IS NOT NULL AND LTRIM(RTRIM(product)) <> ''
           AND signature_text IS NOT NULL AND LTRIM(RTRIM(signature_text)) <> ''
           AND (? = 1 OR CatalogCheckedUtc IS NULL)
+          {batch_filter}
         ORDER BY ingested_at DESC, thread_id DESC
         """,
         int(limit),
         1 if force else 0,
+        *batch_args,
     )
     cols = [c[0] for c in cur.description]
     return [dict(zip(cols, row)) for row in cur.fetchall()]
@@ -505,6 +509,7 @@ def run_phase1c_emergent_cluster(req: func.HttpRequest) -> func.HttpResponse:
         limit = int(req.params.get("limit", "20"))
         batch_size = int(req.params.get("batch_size", "10"))
         force = req.params.get("force", "0") == "1"
+        batch_id: Optional[str] = (req.params.get("batch_id") or "").strip() or None
 
         slice_limit = int(req.params.get("slice_limit", "800"))
         max_slices = int(req.params.get("max_slices", "4"))
@@ -522,7 +527,7 @@ def run_phase1c_emergent_cluster(req: func.HttpRequest) -> func.HttpResponse:
 
         with sql_connect() as cnx:
             catalog_rows = fetch_emergent_catalog(cnx, max_rows=8000)
-            rows = fetch_emergent_threads(cnx, limit=limit, force=force)
+            rows = fetch_emergent_threads(cnx, limit=limit, force=force, batch_id=batch_id)
 
             if not rows:
                 return func.HttpResponse(

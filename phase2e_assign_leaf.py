@@ -168,8 +168,11 @@ def fetch_next_product_for_assignment(
     cnx: pyodbc.Connection,
     include_completed: bool,
     exclude_products: Set[str],
+    batch_id: Optional[str] = None,
 ) -> Optional[str]:
     cur = cnx.cursor()
+    batch_filter = "AND batch_id = ?" if batch_id else ""
+    batch_args = [batch_id] if batch_id else []
 
     if exclude_products:
         placeholders = ",".join("?" for _ in exclude_products)
@@ -185,14 +188,16 @@ def fetch_next_product_for_assignment(
               AND (? = 1 OR AssignmentCompletedUtc IS NULL)
               AND AssignmentStartedUtc IS NULL
               AND product NOT IN ({placeholders})
+              {batch_filter}
             ORDER BY CatalogCheckedUtc DESC, ingested_at DESC, thread_id DESC
             """,
             1 if include_completed else 0,
             *[p for p in exclude_products],
+            *batch_args,
         )
     else:
         cur.execute(
-            """
+            f"""
             SELECT TOP (1) product
             FROM dbo.thread_enrichment
             WHERE CatalogCheckedUtc IS NOT NULL
@@ -202,9 +207,11 @@ def fetch_next_product_for_assignment(
               AND ISNULL(solution_usefulness, 0.0) >= 0.3
               AND (? = 1 OR AssignmentCompletedUtc IS NULL)
               AND AssignmentStartedUtc IS NULL
+              {batch_filter}
             ORDER BY CatalogCheckedUtc DESC, ingested_at DESC, thread_id DESC
             """,
             1 if include_completed else 0,
+            *batch_args,
         )
 
     row = cur.fetchone()
@@ -218,10 +225,13 @@ def claim_threads_for_assignment_product(
     batch_size: int,
     include_completed: bool,
     product: str,
+    batch_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     cur = cnx.cursor()
+    batch_filter = "AND batch_id = ?" if batch_id else ""
+    batch_args = [batch_id] if batch_id else []
     cur.execute(
-        """
+        f"""
         ;WITH cte AS (
             SELECT TOP (?)
                 thread_id
@@ -233,6 +243,7 @@ def claim_threads_for_assignment_product(
               AND ISNULL(solution_usefulness, 0.0) >= 0.3
               AND (? = 1 OR AssignmentCompletedUtc IS NULL)
               AND AssignmentStartedUtc IS NULL
+              {batch_filter}
             ORDER BY CatalogCheckedUtc DESC, ingested_at DESC, thread_id DESC
         )
         UPDATE te
@@ -253,6 +264,7 @@ def claim_threads_for_assignment_product(
         int(batch_size),
         str(product),
         1 if include_completed else 0,
+        *batch_args,
     )
 
     cols = [c[0] for c in cur.description]
@@ -1413,6 +1425,7 @@ def run_phase2e_assign_leaf(req: func.HttpRequest) -> func.HttpResponse:
         max_batches = int(req.params.get("max_batches", "10"))
         max_workers = int(req.params.get("max_workers", "2"))
         force = (req.params.get("force", "0") == "1")
+        batch_id: Optional[str] = (req.params.get("batch_id") or "").strip() or None
 
         max_catalog = int(req.params.get("max_catalog", "15000"))
         max_per_level = int(req.params.get("max_per_level", "150"))
@@ -1515,6 +1528,7 @@ def run_phase2e_assign_leaf(req: func.HttpRequest) -> func.HttpResponse:
                             cnx,
                             include_completed=include_completed,
                             exclude_products=drained_products if force else set(),
+                            batch_id=batch_id,
                         )
                         if not chosen_product:
                             cnx.commit()
@@ -1527,6 +1541,7 @@ def run_phase2e_assign_leaf(req: func.HttpRequest) -> func.HttpResponse:
                         batch_size=batch_size,
                         include_completed=include_completed,
                         product=chosen_product,
+                        batch_id=batch_id,
                     )
                     cnx.commit()
 

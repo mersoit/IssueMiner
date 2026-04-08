@@ -57,6 +57,9 @@ def phase1b_cluster_route(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="phase1c_emergent_cluster", methods=["GET", "POST"])
 def phase1c_emergent_cluster_route(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Optional: ?batch_id=<id> to restrict to a scoped batch.
+    """
     return run_phase1c_emergent_cluster(req)
 
 @app.route(route="phase2e_assign_leaf", methods=["GET", "POST"])
@@ -65,6 +68,7 @@ def phase2e_assign_leaf_route(req: func.HttpRequest) -> func.HttpResponse:
     Examples:
       - /api/phase2e_assign_leaf?limit=50
       - /api/phase2e_assign_leaf?limit=50&force=1
+      - /api/phase2e_assign_leaf?batch_id=demo_1
     """
     return run_phase2e_assign_leaf(req)
 
@@ -72,6 +76,9 @@ from phase2f_detect_emergent import run_phase2f_detect_emergent
 
 @app.route(route="phase2f_detect_emergent", methods=["GET", "POST"])
 def phase2f_detect_emergent_route(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Optional: ?batch_id=<id> to restrict to a scoped batch.
+    """
     return run_phase2f_detect_emergent(req)
 
 from phase_emergent_assign import run_emergent_assign
@@ -142,6 +149,7 @@ def phase4a_nugget_mining_route(req: func.HttpRequest) -> func.HttpResponse:
     Examples:
       - /api/phase4a_nugget_mining
       - /api/phase4a_nugget_mining?limit=10
+      - /api/phase4a_nugget_mining?batch_id=demo_1
     """
     return run_phase4a_nugget_mining(req)
 
