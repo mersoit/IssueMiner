@@ -27,7 +27,8 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -47,8 +48,9 @@ _HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 _REQUEST_TIMEOUT = 30
-_REQUEST_DELAY   = 0.3   # seconds between page fetches — be polite
+_REQUEST_DELAY   = 0.05  # seconds between thread submissions — light rate limiting
 _MAX_RETRIES     = 3
+_CRAWL_WORKERS   = int(os.getenv("MS_LEARN_CRAWL_WORKERS", "8"))
 _MSLEARN_BASE    = "https://learn.microsoft.com"
 
 
@@ -320,31 +322,43 @@ def crawl_ms_learn_docs(
 
     logger.info("Unique pages to scrape: %d", len(pages))
 
-    # 4. Fetch each page and extract content
-    results: List[Dict[str, Any]] = []
-    for i, page in enumerate(pages, start=1):
+    # 4. Fetch each page and extract content — parallel
+    def _fetch_page(args: Tuple[int, Dict[str, str]]) -> Optional[Dict[str, Any]]:
+        i, page = args
         url = page["url"]
-        logger.info("[%d/%d] %s", i, len(pages), url)
-
         html = _fetch(url, session)
         if not html:
             logger.warning("Skipping (fetch failed): %s", url)
-            continue
-
+            return None
         extracted = _extract_title_and_body(html)
         title = extracted["title"] or page["toc_title"] or ""
         body  = extracted["body"]
-
-        results.append({
+        logger.info("[%d/%d] %s", i, len(pages), url)
+        return {
             "Order":   i,
             "Product": product,
             "URL":     url,
             "Title":   title,
             "Body":    body,
-        })
+        }
 
-        if delay > 0 and i < len(pages):
-            time.sleep(delay)
+    results: List[Dict[str, Any]] = []
+    workers = max(1, min(_CRAWL_WORKERS, len(pages)))
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {}
+        for i, page in enumerate(pages, start=1):
+            futures[ex.submit(_fetch_page, (i, page))] = i
+            if delay > 0:
+                time.sleep(delay)          # light stagger between submissions
+
+        for fut in as_completed(futures):
+            row = fut.result()
+            if row:
+                results.append(row)
+
+    # Restore original TOC order
+    results.sort(key=lambda r: r["Order"])
 
     logger.info("Done. %d pages scraped.", len(results))
     return results
