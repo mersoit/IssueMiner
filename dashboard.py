@@ -242,42 +242,72 @@ elif page == "📦 Products":
             st.subheader("⚡ Enrich Threads (Phase 1A)")
             st.caption(
                 "Runs Phase 1A on unenriched rows in ThreadsClean. "
-                "Already-enriched threads are always skipped automatically — "
-                "the product is assigned by the LLM during enrichment, not before."
+                "Already-enriched threads are always skipped automatically. "
+                "Large limits are processed in repeated batches to avoid timeouts."
             )
             en1, en2, en3 = st.columns(3)
             with en1:
                 enrich_limit = st.number_input(
-                    "Limit", min_value=1, max_value=10000, value=50, step=25,
+                    "Total limit", min_value=1, max_value=100000, value=500, step=100,
                     key="global_elimit",
-                    help="Max number of unenriched threads to process.",
+                    help="Total number of unenriched threads to process across all batches.",
                 )
             with en2:
-                enrich_from = st.date_input("Processed from (optional)", value=None, key="global_efrom")
+                enrich_batch = st.number_input(
+                    "Batch size", min_value=25, max_value=500, value=100, step=25,
+                    key="global_ebatch",
+                    help="Threads per API call. Keep ≤200 to avoid timeouts.",
+                )
             with en3:
-                enrich_to = st.date_input("Processed to (optional)", value=None, key="global_eto")
+                enrich_from = st.date_input("From date (optional)", value=None, key="global_efrom")
+
+            enrich_to = st.date_input("To date (optional)", value=None, key="global_eto")
 
             if st.button("▶️ Run Enrich", key="global_enrich_run", use_container_width=True):
                 import requests as _req
-                params = f"limit={int(enrich_limit)}"
-                if enrich_from:
-                    params += f"&date_from={enrich_from.isoformat()}"
-                if enrich_to:
-                    params += f"&date_to={enrich_to.isoformat()}T23:59:59"
-                url = f"http://localhost:7071/api/phase1a_enrich_batch?{params}"
-                with st.spinner(f"⚡ Enriching up to {int(enrich_limit)} threads…"):
+                total_limit = int(enrich_limit)
+                batch_size  = int(enrich_batch)
+                remaining   = total_limit
+                grand_total = 0
+                batch_num   = 0
+
+                prog   = st.progress(0, text="Starting enrichment…")
+                status = st.empty()
+
+                while remaining > 0:
+                    this_batch = min(batch_size, remaining)
+                    batch_num += 1
+                    params = f"limit={this_batch}"
+                    if enrich_from:
+                        params += f"&date_from={enrich_from.isoformat()}"
+                    if enrich_to:
+                        params += f"&date_to={enrich_to.isoformat()}T23:59:59"
+                    url = f"http://localhost:7071/api/phase1a_enrich_batch?{params}"
+                    status.info(f"Batch {batch_num}: enriching up to {this_batch} threads… (total so far: {grand_total})")
                     try:
-                        r = _req.post(url, timeout=600)
-                        if r.status_code == 200:
-                            body = r.json()
-                            total = body.get("total", body.get("processed", "?")) if isinstance(body, dict) else "?"
-                            st.success(f"✅ Enriched {total} threads.")
-                            st.session_state.show_enrich_form = False
-                            st.rerun()
-                        else:
+                        r = _req.post(url, timeout=300)
+                        if r.status_code != 200:
                             st.error(f"HTTP {r.status_code}: {r.text[:300]}")
+                            break
+                        body = r.json() if isinstance(r.json(), dict) else {}
+                        processed = int(body.get("processed", 0))
+                        grand_total += processed
+                        remaining  -= processed
+                        prog.progress(
+                            min(grand_total / total_limit, 1.0),
+                            text=f"Enriched {grand_total}/{total_limit} threads…",
+                        )
+                        # If the API returned fewer than requested, nothing left to do
+                        if processed < this_batch:
+                            break
                     except Exception as ex:
-                        st.error(f"Enrich failed: {ex}")
+                        st.error(f"Enrich failed on batch {batch_num}: {ex}")
+                        break
+
+                prog.progress(1.0, text="Done.")
+                st.success(f"✅ Enriched **{grand_total}** threads in {batch_num} batch(es).")
+                st.session_state.show_enrich_form = False
+                st.rerun()
 
     if st.session_state.show_new_product_form:
         with st.container(border=True):
