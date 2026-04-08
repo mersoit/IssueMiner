@@ -25,7 +25,7 @@ import logging
 import datetime as dt
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import requests
@@ -332,15 +332,14 @@ def crawl_tag_url(
     max_pages: int = 9999,
     session: Optional[requests.Session] = None,
     existing_qids: Optional[set] = None,
+    progress_callback: Optional[Callable[[str, int, int, str], None]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Crawl one Microsoft Q&A tag URL end-to-end.
 
-    1. Detect last page from pagination.
-    2. Walk listing pages, collect question links (skip existing_qids).
-    3. Fetch + parse each question page.
-
-    Returns list of dicts ready for ingest_crawl_results().
+    progress_callback(phase, done, total, message) is called:
+      - once after listing pages are collected
+      - every ~5% of question pages completed
     """
     sess = session or requests.Session()
     skip = existing_qids or set()
@@ -393,6 +392,9 @@ def crawl_tag_url(
                         all_links.append(lnk)
 
     logging.info("phase0 question links to scrape: %d", len(all_links))
+    if progress_callback:
+        progress_callback("listing", len(all_links), len(all_links),
+                          f"Found {len(all_links)} new questions — fetching pages…")
 
     # -- question pages (parallel) --
     def _fetch_question(lnk: Dict[str, str]) -> Optional[Dict[str, Any]]:
@@ -416,8 +418,12 @@ def crawl_tag_url(
             return None
 
     results: List[Dict[str, Any]] = []
-    workers = max(1, min(_QUESTION_WORKERS, len(all_links)))
+    total_q = len(all_links)
+    workers = max(1, min(_QUESTION_WORKERS, total_q))
     completed = 0
+    notify_every = max(1, total_q // 20)   # fire callback every ~5%
+    last_notified = 0
+
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {}
         for lnk in all_links:
@@ -430,7 +436,16 @@ def crawl_tag_url(
                 results.append(detail)
             completed += 1
             if completed % 50 == 0:
-                logging.info("phase0 scraped %d/%d", completed, len(all_links))
+                logging.info("phase0 scraped %d/%d", completed, total_q)
+            if progress_callback and (completed - last_notified) >= notify_every:
+                last_notified = completed
+                pct = int(completed / total_q * 100) if total_q else 100
+                progress_callback("questions", completed, total_q,
+                                  f"Fetched {completed}/{total_q} questions ({pct}%)…")
+
+    if progress_callback:
+        progress_callback("questions", total_q, total_q,
+                          f"Done — {len(results)} questions scraped.")
 
     logging.info("phase0 DONE tag=%s scraped=%d", tag_url[:80], len(results))
     return results
@@ -550,6 +565,7 @@ def crawl_product(
     incremental: bool = True,
     export_path: Optional[str] = None,
     cnx: Optional[pyodbc.Connection] = None,
+    progress_callback: Optional[Callable[[str, int, int, str], None]] = None,
 ) -> Dict[str, Any]:
     """
     Crawl multiple tag URLs for one product.
@@ -573,6 +589,7 @@ def crawl_product(
             max_pages=max_pages,
             session=sess,
             existing_qids=existing,
+            progress_callback=progress_callback,
         )
         all_results.extend(results)
         for r in results:

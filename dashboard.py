@@ -368,25 +368,35 @@ elif page == "📦 Products":
 
                         if save_and_crawl:
                             if tag_urls:
-                                with st.spinner("🕷️ Crawling — this may take a while..."):
-                                    try:
-                                        from phase0_crawl_threads import crawl_product
-                                        summary = crawl_product(
-                                            tag_urls=tag_urls,
-                                            incremental=True,
-                                            cnx=cnx,
-                                        )
-                                        update_product_crawl_time(
-                                            cnx, pid,
-                                            crawl_count=summary.get('ingested', 0),
-                                        )
-                                        st.success(
-                                            f"🕷️ Crawl complete: "
-                                            f"{summary['questions_scraped']} scraped, "
-                                            f"{summary['ingested']} ingested"
-                                        )
-                                    except Exception as crawl_ex:
-                                        st.error(f"Crawl failed: {crawl_ex}")
+                                crawl_prog = st.progress(0, text="🕷️ Starting crawl…")
+                                crawl_status = st.empty()
+
+                                def _crawl_cb(phase, done, total, msg):
+                                    frac = (done / total) if total else 1.0
+                                    crawl_prog.progress(min(frac, 1.0), text=msg)
+                                    crawl_status.caption(msg)
+
+                                try:
+                                    from phase0_crawl_threads import crawl_product
+                                    summary = crawl_product(
+                                        tag_urls=tag_urls,
+                                        incremental=True,
+                                        cnx=cnx,
+                                        progress_callback=_crawl_cb,
+                                    )
+                                    update_product_crawl_time(
+                                        cnx, pid,
+                                        crawl_count=summary.get('ingested', 0),
+                                    )
+                                    crawl_prog.progress(1.0, text="✅ Crawl complete")
+                                    crawl_status.empty()
+                                    st.success(
+                                        f"🕷️ Crawl complete: "
+                                        f"{summary['questions_scraped']} scraped, "
+                                        f"{summary['ingested']} ingested"
+                                    )
+                                except Exception as crawl_ex:
+                                    st.error(f"Crawl failed: {crawl_ex}")
                             else:
                                 st.warning("No tag URLs to crawl — add URLs first.")
                                 update_product_crawl_time(cnx, pid, crawl_count=0)
