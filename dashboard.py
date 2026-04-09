@@ -90,55 +90,64 @@ st.set_page_config(
 # ─────────────────────────────────────────────────────────
 # Background task runner
 # ─────────────────────────────────────────────────────────
-# Allows long-running pipeline loops and crawls to run in a
-# background thread so the dashboard stays responsive.
-# State is stored in st.session_state under a task key.
+# st.session_state is NOT accessible from background threads.
+# We use a plain module-level dict (_BG_TASKS) as the shared
+# state store. The main thread reads from it on every rerun.
+
+_BG_TASKS: Dict[str, Any] = {}
+_BG_LOCK = threading.Lock()
+
 
 def _bg_task_start(task_key: str, fn, *args, **kwargs) -> None:
-    """Launch fn(*args, **kwargs) in a daemon thread. State stored in session_state."""
-    st.session_state[task_key] = {
-        "status": "running",
-        "log":    [],
-        "result": None,
-        "started_at": dt.datetime.utcnow().isoformat(),
-    }
+    """Launch fn(*args, **kwargs) in a daemon thread."""
+    with _BG_LOCK:
+        _BG_TASKS[task_key] = {
+            "status":     "running",
+            "log":        [],
+            "result":     None,
+            "started_at": dt.datetime.utcnow().isoformat(),
+        }
 
     def _run():
         try:
             result = fn(*args, **kwargs)
-            st.session_state[task_key]["result"] = result
-            st.session_state[task_key]["status"] = "done"
+            with _BG_LOCK:
+                _BG_TASKS[task_key]["result"] = result
+                _BG_TASKS[task_key]["status"] = "done"
         except Exception as e:
-            st.session_state[task_key]["status"] = "error"
-            st.session_state[task_key]["result"] = str(e)
+            with _BG_LOCK:
+                _BG_TASKS[task_key]["status"] = "error"
+                _BG_TASKS[task_key]["result"] = str(e)
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _bg_log(task_key: str, msg: str) -> None:
-    """Append a log line from inside the background thread."""
-    if task_key in st.session_state:
-        st.session_state[task_key]["log"].append(msg)
+    """Append a log line — safe to call from any thread."""
+    with _BG_LOCK:
+        if task_key in _BG_TASKS:
+            _BG_TASKS[task_key]["log"].append(msg)
 
 
 def _bg_task_ui(task_key: str, title: str) -> bool:
     """
     Render status widget for a background task.
-    Returns True while the task is still running (caller should st.rerun).
+    Returns True while the task is still running (triggers auto-rerun).
     """
-    state = st.session_state.get(task_key)
+    with _BG_LOCK:
+        state = dict(_BG_TASKS.get(task_key) or {})
+
     if not state:
         return False
 
     status = state.get("status", "unknown")
-    log    = state.get("log", [])
+    log    = list(state.get("log") or [])
 
     if status == "running":
         st.info(f"⏳ **{title}** is running…")
         if log:
             with st.expander("Live log", expanded=True):
-                st.text("\n".join(log[-40:]))   # last 40 lines
+                st.text("\n".join(log[-40:]))
         time.sleep(2)
         st.rerun()
         return True
@@ -153,14 +162,19 @@ def _bg_task_ui(task_key: str, title: str) -> bool:
             with st.expander("Log", expanded=False):
                 st.text("\n".join(log))
         if st.button(f"Clear {title} status", key=f"{task_key}_clear"):
-            del st.session_state[task_key]
+            with _BG_LOCK:
+                _BG_TASKS.pop(task_key, None)
             st.rerun()
         return False
 
     if status == "error":
-        st.error(f"❌ **{title}** failed: {state.get('result','')}")
+        st.error(f"❌ **{title}** failed: {state.get('result', '')}")
+        if log:
+            with st.expander("Log", expanded=False):
+                st.text("\n".join(log))
         if st.button(f"Clear {title} status", key=f"{task_key}_clear"):
-            del st.session_state[task_key]
+            with _BG_LOCK:
+                _BG_TASKS.pop(task_key, None)
             st.rerun()
         return False
 
@@ -168,13 +182,13 @@ def _bg_task_ui(task_key: str, title: str) -> bool:
 
 
 def _is_bg_running(task_key: str) -> bool:
-    return st.session_state.get(task_key, {}).get("status") == "running"
+    with _BG_LOCK:
+        return _BG_TASKS.get(task_key, {}).get("status") == "running"
 
 
 # ─────────────────────────────────────────────────────────
 # Cached DB connection
 # ─────────────────────────────────────────────────────────
-
 @st.cache_resource(ttl=300)
 def _get_cnx():
     cnx = sql_connect()
@@ -1324,27 +1338,26 @@ elif page == "⚙️ Pipelines":
 
                     def _run_pipeline(phases, product, limit):
                         import requests as _rq
-                        log = st.session_state["pipeline_run"]["log"]
                         for phase_name, url, loop in phases:
                             grand, call_n, ok = 0, 0, True
                             while True:
                                 call_n += 1
                                 try:
                                     r = _rq.post(url, timeout=300)
-                                    body = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
+                                    body = r.json() if "json" in r.headers.get("content-type", "") else {}
                                     if r.status_code != 200:
-                                        log.append(f"⚠️ {phase_name}: HTTP {r.status_code}")
+                                        _bg_log("pipeline_run", f"⚠️ {phase_name}: HTTP {r.status_code}")
                                         ok = False; break
                                     processed = int(body.get("processed", body.get("ingested", 0)) or 0)
                                     grand += processed
-                                    log.append(f"  {phase_name} call {call_n}: +{processed} (total {grand})")
+                                    _bg_log("pipeline_run", f"  {phase_name} call {call_n}: +{processed} (total {grand})")
                                     if not loop or processed == 0:
                                         break
                                 except Exception as ex:
-                                    log.append(f"❌ {phase_name}: {ex}")
+                                    _bg_log("pipeline_run", f"❌ {phase_name}: {ex}")
                                     ok = False; break
                             suffix = f" ({call_n} calls)" if call_n > 1 else ""
-                            log.append(f"{'✅' if ok else '❌'} {phase_name}: {'OK' if ok else 'FAILED'} processed={grand}{suffix}")
+                            _bg_log("pipeline_run", f"{'✅' if ok else '❌'} {phase_name}: {'OK' if ok else 'FAILED'} processed={grand}{suffix}")
                         return {"product": product, "limit": limit, "phases": len(phases)}
 
                     _bg_task_start("pipeline_run", _run_pipeline, demo_phases, demo_product, demo_limit)
