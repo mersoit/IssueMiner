@@ -473,19 +473,25 @@ elif page == "📦 Products":
 
                         if save_and_crawl:
                             if tag_urls:
-                                def _run_crawl(urls, prod, p_id, db_cnx):
-                                    from phase0_crawl_threads import crawl_product as _cp
+                                def _run_crawl(urls, prod, p_id):
+                                    from phase0_crawl_threads import crawl_product as _cp, _sql_connect
                                     task_key = "product_crawl"
-                                    def _cb(phase, done, total, msg):
-                                        _bg_log(task_key, msg)
-                                    summary = _cp(tag_urls=urls, incremental=True,
-                                                  cnx=db_cnx, progress_callback=_cb)
-                                    update_product_crawl_time(db_cnx, p_id,
-                                                              crawl_count=summary.get("ingested", 0))
-                                    return summary
+                                    # Open a fresh connection inside the thread — pyodbc is not thread-safe
+                                    bg_cnx = _sql_connect()
+                                    try:
+                                        def _cb(phase, done, total, msg):
+                                            _bg_log(task_key, msg)
+                                        summary = _cp(tag_urls=urls, incremental=True,
+                                                      cnx=bg_cnx, progress_callback=_cb)
+                                        update_product_crawl_time(bg_cnx, p_id,
+                                                                  crawl_count=summary.get("ingested", 0))
+                                        return summary
+                                    finally:
+                                        bg_cnx.close()
 
                                 _bg_task_start("product_crawl", _run_crawl,
-                                               tag_urls, prod_name.strip(), pid, cnx)
+                                               tag_urls, prod_name.strip(), pid)
+                                st.session_state.show_new_product_form = False
                                 st.rerun()
                             else:
                                 st.warning("No tag URLs to crawl — add URLs first.")
