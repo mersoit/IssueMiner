@@ -75,6 +75,7 @@ _SEED_PRODUCTS_HINT = [
     "ARM", "Policy", "Virtual Network", "Monitor", "OpenAI",
     "Entra External ID", "System Center",
     "Application Gateway", "Front Door", "ExpressRoute",
+    "Internet Information Services",
 ]
 
 # ─────────────────────────────────────────────────────────

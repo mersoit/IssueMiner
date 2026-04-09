@@ -422,6 +422,9 @@ _PRODUCT_ALIASES: Dict[str, str] = {
     "vnet": "Virtual Network",
     "Azure Virtual Network": "Virtual Network",
     "Azure VNet": "Virtual Network",
+    "IIS": "Internet Information Services",
+    "Internet Information Server": "Internet Information Services",
+    "Windows IIS": "Internet Information Services",
 }
 
 _SEED_PRODUCTS: List[str] = [
@@ -429,7 +432,7 @@ _SEED_PRODUCTS: List[str] = [
     "App Service", "Redis", "Storage Account", "Logic Apps",
     "Ai Search", "Service Bus", "Event Grid", "Event Hub",
     "ARM", "Policy", "Virtual Network", "Monitor", "OpenAI",
-    "Entra External ID", "System Center"
+    "Entra External ID", "System Center", "Internet Information Services",
 ]
 
 
