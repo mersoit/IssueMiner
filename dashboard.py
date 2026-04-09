@@ -1305,8 +1305,26 @@ elif page == "⚙️ Pipelines":
                     help="Only threads stamped with this batch_id will be processed by 1B, 1C, 2E, 2F and 4A.",
                 )
 
+            demo_mode = st.checkbox(
+                "🧪 Demo mode — lower thresholds for Phase 3 & 4 (use when running on a small thread set)",
+                value=True,
+                key="demo_mode",
+                help=(
+                    "Phase 3: min_members=1, min_usefulness=0.3\n"
+                    "Phase 4B: min_members=1, min_usefulness=0.1\n"
+                    "Phase 4C: min_members=1, child_min_members=1\n"
+                    "Phase 4D: min_members=1, require_child_wiki=0"
+                ),
+            )
+
             _FUNC_BASE = "http://localhost:7071/api"
             _b = f"&batch_id={demo_batch_id.strip()}" if demo_batch_id.strip() else ""
+
+            # Demo-mode threshold overrides
+            _p3_thresh  = "min_members=1&min_usefulness=0.3"          if demo_mode else "min_members=2&min_usefulness=0.6"
+            _p4b_thresh = "min_members=1&min_usefulness=0.1"          if demo_mode else "min_members=3&min_usefulness=0.4"
+            _p4c_thresh = "min_members=1&child_min_members=1"         if demo_mode else "min_members=6&child_min_members=3"
+            _p4d_thresh = "min_members=1&require_child_wiki=0"        if demo_mode else "min_members=1&require_child_wiki=1"
 
             # Tuple: (display_name, url, loop_until_empty, per_call_timeout_secs)
             _batch = min(int(demo_limit), 20)   # safe per-call limit for LLM-heavy phases
@@ -1327,7 +1345,7 @@ elif page == "⚙️ Pipelines":
                  f"{_FUNC_BASE}/phase2g_count_leaves?product={demo_product}",
                  False,  60),
                 ("Phase 3 – Common playbooks",
-                 f"{_FUNC_BASE}/phase3_common?limit={_batch}&product={demo_product}",
+                 f"{_FUNC_BASE}/phase3_common?limit={_batch}&product={demo_product}&{_p3_thresh}",
                  True,  180),
                 ("Phase 3 – Push to wiki",
                  f"{_FUNC_BASE}/phase3_push?limit={demo_limit}",
@@ -1336,13 +1354,13 @@ elif page == "⚙️ Pipelines":
                  f"{_FUNC_BASE}/phase4a_nugget_mining?limit={_batch}&product={demo_product}{_b}",
                  True,  120),
                 ("Phase 4B – Variants wiki",
-                 f"{_FUNC_BASE}/phase4b_populate_variants?limit={_batch}&product={demo_product}",
+                 f"{_FUNC_BASE}/phase4b_populate_variants?limit={_batch}&product={demo_product}&{_p4b_thresh}",
                  True,  180),
                 ("Phase 4C – Scenarios wiki",
-                 f"{_FUNC_BASE}/phase4c_populate_scenarios?limit={_batch}&product={demo_product}",
+                 f"{_FUNC_BASE}/phase4c_populate_scenarios?limit={_batch}&product={demo_product}&{_p4c_thresh}",
                  True,  180),
                 ("Phase 4D – Topics wiki",
-                 f"{_FUNC_BASE}/phase4d_populate_topics?limit={_batch}&product={demo_product}",
+                 f"{_FUNC_BASE}/phase4d_populate_topics?limit={_batch}&product={demo_product}&{_p4d_thresh}",
                  True,  180),
             ]
             # Tuple: (name, url, loop_until_empty, per_call_timeout_secs)
