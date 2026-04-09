@@ -9,7 +9,10 @@ import os
 import sys
 import json
 import re
+import time
+import threading
 import datetime as dt
+from typing import Any, Dict, Optional
 
 import streamlit as st
 import pandas as pd
@@ -83,6 +86,90 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ─────────────────────────────────────────────────────────
+# Background task runner
+# ─────────────────────────────────────────────────────────
+# Allows long-running pipeline loops and crawls to run in a
+# background thread so the dashboard stays responsive.
+# State is stored in st.session_state under a task key.
+
+def _bg_task_start(task_key: str, fn, *args, **kwargs) -> None:
+    """Launch fn(*args, **kwargs) in a daemon thread. State stored in session_state."""
+    st.session_state[task_key] = {
+        "status": "running",
+        "log":    [],
+        "result": None,
+        "started_at": dt.datetime.utcnow().isoformat(),
+    }
+
+    def _run():
+        try:
+            result = fn(*args, **kwargs)
+            st.session_state[task_key]["result"] = result
+            st.session_state[task_key]["status"] = "done"
+        except Exception as e:
+            st.session_state[task_key]["status"] = "error"
+            st.session_state[task_key]["result"] = str(e)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+
+def _bg_log(task_key: str, msg: str) -> None:
+    """Append a log line from inside the background thread."""
+    if task_key in st.session_state:
+        st.session_state[task_key]["log"].append(msg)
+
+
+def _bg_task_ui(task_key: str, title: str) -> bool:
+    """
+    Render status widget for a background task.
+    Returns True while the task is still running (caller should st.rerun).
+    """
+    state = st.session_state.get(task_key)
+    if not state:
+        return False
+
+    status = state.get("status", "unknown")
+    log    = state.get("log", [])
+
+    if status == "running":
+        st.info(f"⏳ **{title}** is running…")
+        if log:
+            with st.expander("Live log", expanded=True):
+                st.text("\n".join(log[-40:]))   # last 40 lines
+        time.sleep(2)
+        st.rerun()
+        return True
+
+    if status == "done":
+        st.success(f"✅ **{title}** complete.")
+        result = state.get("result")
+        if result:
+            with st.expander("Result", expanded=False):
+                st.json(result) if isinstance(result, (dict, list)) else st.text(str(result))
+        if log:
+            with st.expander("Log", expanded=False):
+                st.text("\n".join(log))
+        if st.button(f"Clear {title} status", key=f"{task_key}_clear"):
+            del st.session_state[task_key]
+            st.rerun()
+        return False
+
+    if status == "error":
+        st.error(f"❌ **{title}** failed: {state.get('result','')}")
+        if st.button(f"Clear {title} status", key=f"{task_key}_clear"):
+            del st.session_state[task_key]
+            st.rerun()
+        return False
+
+    return False
+
+
+def _is_bg_running(task_key: str) -> bool:
+    return st.session_state.get(task_key, {}).get("status") == "running"
+
 
 # ─────────────────────────────────────────────────────────
 # Cached DB connection
@@ -222,6 +309,10 @@ elif page == "📦 Products":
     st.title("📦 Products")
 
     cnx = get_cnx()
+
+    # ── Background task status widgets ──
+    _bg_task_ui("product_crawl", "Thread Crawl")
+    _bg_task_ui("pipeline_run",  "Pipeline Run")
 
     # ── Add New Product (inline) ──
     if "show_new_product_form" not in st.session_state:
@@ -368,35 +459,20 @@ elif page == "📦 Products":
 
                         if save_and_crawl:
                             if tag_urls:
-                                crawl_prog = st.progress(0, text="🕷️ Starting crawl…")
-                                crawl_status = st.empty()
+                                def _run_crawl(urls, prod, p_id, db_cnx):
+                                    from phase0_crawl_threads import crawl_product as _cp
+                                    task_key = "product_crawl"
+                                    def _cb(phase, done, total, msg):
+                                        _bg_log(task_key, msg)
+                                    summary = _cp(tag_urls=urls, incremental=True,
+                                                  cnx=db_cnx, progress_callback=_cb)
+                                    update_product_crawl_time(db_cnx, p_id,
+                                                              crawl_count=summary.get("ingested", 0))
+                                    return summary
 
-                                def _crawl_cb(phase, done, total, msg):
-                                    frac = (done / total) if total else 1.0
-                                    crawl_prog.progress(min(frac, 1.0), text=msg)
-                                    crawl_status.caption(msg)
-
-                                try:
-                                    from phase0_crawl_threads import crawl_product
-                                    summary = crawl_product(
-                                        tag_urls=tag_urls,
-                                        incremental=True,
-                                        cnx=cnx,
-                                        progress_callback=_crawl_cb,
-                                    )
-                                    update_product_crawl_time(
-                                        cnx, pid,
-                                        crawl_count=summary.get('ingested', 0),
-                                    )
-                                    crawl_prog.progress(1.0, text="✅ Crawl complete")
-                                    crawl_status.empty()
-                                    st.success(
-                                        f"🕷️ Crawl complete: "
-                                        f"{summary['questions_scraped']} scraped, "
-                                        f"{summary['ingested']} ingested"
-                                    )
-                                except Exception as crawl_ex:
-                                    st.error(f"Crawl failed: {crawl_ex}")
+                                _bg_task_start("product_crawl", _run_crawl,
+                                               tag_urls, prod_name.strip(), pid, cnx)
+                                st.rerun()
                             else:
                                 st.warning("No tag URLs to crawl — add URLs first.")
                                 update_product_crawl_time(cnx, pid, crawl_count=0)
@@ -1053,6 +1129,9 @@ elif page == "⚙️ Pipelines":
 
     cnx = get_cnx()
 
+    # ── Background task status ──
+    _bg_task_ui("pipeline_run", "Pipeline Run")
+
     # Pipeline watermarks
     st.subheader("Pipeline Watermarks")
     try:
@@ -1237,44 +1316,36 @@ elif page == "⚙️ Pipelines":
             ]
             # (name, url, loop_until_empty)
 
-            if st.button("▶️ Run All Phases", key="demo_run", use_container_width=True):
-                import requests as _req
-                progress = st.progress(0, text="Starting…")
-                log_area = st.empty()
-                run_logs = []
+            if _bg_task_ui("pipeline_run", f"Pipeline – {demo_product}"):
+                pass  # rerun already triggered inside _bg_task_ui
+            elif not _is_bg_running("pipeline_run"):
+                if st.button("▶️ Run All Phases", key="demo_run", use_container_width=True):
+                    import requests as _req
 
-                for i, (phase_name, url, loop) in enumerate(demo_phases):
-                    progress.progress(i / len(demo_phases), text=f"Running {phase_name}…")
-                    grand = 0
-                    call_n = 0
-                    ok = True
-                    while True:
-                        call_n += 1
-                        try:
-                            r = _req.post(url, timeout=300)
-                            try:
-                                body = r.json()
-                            except Exception:
-                                body = r.text[:300]
-                            if r.status_code != 200:
-                                run_logs.append(f"⚠️ {phase_name}: HTTP {r.status_code} — {str(body)[:200]}")
-                                ok = False
-                                break
-                            processed = int(body.get("processed", body.get("ingested", 0)) or 0) if isinstance(body, dict) else 0
-                            grand += processed
-                            log_area.markdown("\n".join(f"- {l}" for l in run_logs) +
-                                              f"\n- ⏳ {phase_name}: call {call_n}, processed so far: {grand}")
-                            # Stop looping if not a looping phase, or if nothing came back
-                            if not loop or processed == 0:
-                                break
-                        except Exception as ex:
-                            run_logs.append(f"❌ {phase_name}: {ex}")
-                            ok = False
-                            break
-                    if ok:
-                        suffix = f" ({call_n} calls)" if call_n > 1 else ""
-                        run_logs.append(f"✅ {phase_name}: OK (processed={grand}){suffix}")
-                    log_area.markdown("\n".join(f"- {l}" for l in run_logs))
+                    def _run_pipeline(phases, product, limit):
+                        import requests as _rq
+                        log = st.session_state["pipeline_run"]["log"]
+                        for phase_name, url, loop in phases:
+                            grand, call_n, ok = 0, 0, True
+                            while True:
+                                call_n += 1
+                                try:
+                                    r = _rq.post(url, timeout=300)
+                                    body = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
+                                    if r.status_code != 200:
+                                        log.append(f"⚠️ {phase_name}: HTTP {r.status_code}")
+                                        ok = False; break
+                                    processed = int(body.get("processed", body.get("ingested", 0)) or 0)
+                                    grand += processed
+                                    log.append(f"  {phase_name} call {call_n}: +{processed} (total {grand})")
+                                    if not loop or processed == 0:
+                                        break
+                                except Exception as ex:
+                                    log.append(f"❌ {phase_name}: {ex}")
+                                    ok = False; break
+                            suffix = f" ({call_n} calls)" if call_n > 1 else ""
+                            log.append(f"{'✅' if ok else '❌'} {phase_name}: {'OK' if ok else 'FAILED'} processed={grand}{suffix}")
+                        return {"product": product, "limit": limit, "phases": len(phases)}
 
-                progress.progress(1.0, text="Done.")
-                st.success(f"Pipeline run complete for **{demo_product}** (limit={demo_limit})")
+                    _bg_task_start("pipeline_run", _run_pipeline, demo_phases, demo_product, demo_limit)
+                    st.rerun()

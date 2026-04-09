@@ -81,14 +81,34 @@ def _fetch(url: str, session: requests.Session) -> Optional[str]:
 
 def _toc_url(root_url: str) -> str:
     """
-    Derive the toc.json URL from the root doc URL.
-    e.g. https://learn.microsoft.com/en-us/azure/application-gateway/
-         -> https://learn.microsoft.com/en-us/azure/application-gateway/toc.json
+    Derive the toc.json URL from a MS Learn URL.
+
+    Handles two cases:
+    - Section root:  .../azure/application-gateway/         -> .../azure/application-gateway/toc.json
+    - Article page:  .../azure/devops/pipelines/get-started/what-is-azure-pipelines?view=...
+                     walks up path segments until toc.json responds with 200.
     """
     parsed = urlparse(root_url)
+    # Strip query string and fragment; normalise trailing slash
     path = parsed.path.rstrip("/")
-    toc_path = path + "/toc.json"
-    return f"{parsed.scheme}://{parsed.netloc}{toc_path}"
+    base = f"{parsed.scheme}://{parsed.netloc}"
+
+    # Try progressively shorter path segments (deepest first)
+    segments = path.split("/")
+    for depth in range(len(segments), 0, -1):
+        candidate_path = "/".join(segments[:depth])
+        if not candidate_path:
+            continue
+        toc = f"{base}{candidate_path}/toc.json"
+        try:
+            r = requests.head(toc, headers=_HEADERS, timeout=10, allow_redirects=True)
+            if r.status_code == 200:
+                return toc
+        except Exception:
+            pass
+
+    # Fallback: just append toc.json to the path as before
+    return f"{base}{path}/toc.json"
 
 
 def _flatten_toc(node: Any, results: List[Dict[str, str]]) -> None:
