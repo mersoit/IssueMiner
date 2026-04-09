@@ -1379,7 +1379,7 @@ elif page == "⚙️ Pipelines":
                 # ── Nugget mining (runs on raw threads, before playbooks) ──────
                 ("Phase 4A – Nuggets",
                  f"{_FUNC_BASE}/phase4a_nugget_mining?limit={_batch}&product={demo_product}{_b}",
-                 True,  120),
+                 True,  240),
                 # ── Playbook generation (needs leaf counts + nuggets) ─────────
                 ("Phase 3 – Common playbooks",
                  f"{_FUNC_BASE}/phase3_common?limit={_batch}&product={demo_product}&{_p3_thresh}",
