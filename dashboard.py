@@ -1308,27 +1308,44 @@ elif page == "⚙️ Pipelines":
             _FUNC_BASE = "http://localhost:7071/api"
             _b = f"&batch_id={demo_batch_id.strip()}" if demo_batch_id.strip() else ""
 
-            # Phases that need a loop (can run long): (name, base_url, loop_param)
-            # loop_param = the param name whose value tells us how many were processed this call
-            _LOOPING_PHASES = {
-                "Phase 1B – Cluster":         f"{_FUNC_BASE}/phase1b_cluster?product={demo_product}&batch_size=10&max_batches=20{_b}",
-                "Phase 1C – Emergent cluster": f"{_FUNC_BASE}/phase1c_emergent_cluster?product={demo_product}&batch_size=10&limit=50{_b}",
-            }
-
+            # Tuple: (display_name, url, loop_until_empty, per_call_timeout_secs)
+            _batch = min(int(demo_limit), 20)   # safe per-call limit for LLM-heavy phases
             demo_phases = [
-                ("Phase 1B – Cluster",         _LOOPING_PHASES["Phase 1B – Cluster"],         True),
-                ("Phase 1C – Emergent cluster", _LOOPING_PHASES["Phase 1C – Emergent cluster"], False),
-                ("Phase 2E – Assign leaf",     f"{_FUNC_BASE}/phase2e_assign_leaf?batch_size=10&max_batches=20&product={demo_product}{_b}", True),
-                ("Phase 2F – Emergent detect", f"{_FUNC_BASE}/phase2f_detect_emergent?batch_size=10&max_batches=20{_b}", False),
-                ("Phase 2G – Count leaves",    f"{_FUNC_BASE}/phase2g_count_leaves?product={demo_product}",                              False),
-                ("Phase 3 – Common playbooks", f"{_FUNC_BASE}/phase3_common?limit={demo_limit}&product={demo_product}",                  False),
-                ("Phase 3 – Push to wiki",     f"{_FUNC_BASE}/phase3_push?limit={demo_limit}",                                          False),
-                ("Phase 4A – Nuggets",         f"{_FUNC_BASE}/phase4a_nugget_mining?limit={demo_limit}&product={demo_product}{_b}",      False),
-                ("Phase 4B – Variants wiki",   f"{_FUNC_BASE}/phase4b_populate_variants?limit={demo_limit}&product={demo_product}",      False),
-                ("Phase 4C – Scenarios wiki",  f"{_FUNC_BASE}/phase4c_populate_scenarios?limit={demo_limit}&product={demo_product}",     False),
-                ("Phase 4D – Topics wiki",     f"{_FUNC_BASE}/phase4d_populate_topics?limit={demo_limit}&product={demo_product}",        False),
+                ("Phase 1B – Cluster",
+                 f"{_FUNC_BASE}/phase1b_cluster?product={demo_product}&batch_size=10&max_batches=20{_b}",
+                 True,  240),
+                ("Phase 1C – Emergent cluster",
+                 f"{_FUNC_BASE}/phase1c_emergent_cluster?product={demo_product}&batch_size=10&limit=50{_b}",
+                 False, 120),
+                ("Phase 2E – Assign leaf",
+                 f"{_FUNC_BASE}/phase2e_assign_leaf?batch_size=10&max_batches=20&product={demo_product}{_b}",
+                 True,  240),
+                ("Phase 2F – Emergent detect",
+                 f"{_FUNC_BASE}/phase2f_detect_emergent?batch_size=10&max_batches=20{_b}",
+                 False, 120),
+                ("Phase 2G – Count leaves",
+                 f"{_FUNC_BASE}/phase2g_count_leaves?product={demo_product}",
+                 False,  60),
+                ("Phase 3 – Common playbooks",
+                 f"{_FUNC_BASE}/phase3_common?limit={_batch}&product={demo_product}",
+                 True,  180),
+                ("Phase 3 – Push to wiki",
+                 f"{_FUNC_BASE}/phase3_push?limit={demo_limit}",
+                 False, 120),
+                ("Phase 4A – Nuggets",
+                 f"{_FUNC_BASE}/phase4a_nugget_mining?limit={_batch}&product={demo_product}{_b}",
+                 True,  120),
+                ("Phase 4B – Variants wiki",
+                 f"{_FUNC_BASE}/phase4b_populate_variants?limit={_batch}&product={demo_product}",
+                 True,  180),
+                ("Phase 4C – Scenarios wiki",
+                 f"{_FUNC_BASE}/phase4c_populate_scenarios?limit={_batch}&product={demo_product}",
+                 True,  180),
+                ("Phase 4D – Topics wiki",
+                 f"{_FUNC_BASE}/phase4d_populate_topics?limit={_batch}&product={demo_product}",
+                 True,  180),
             ]
-            # (name, url, loop_until_empty)
+            # Tuple: (name, url, loop_until_empty, per_call_timeout_secs)
 
             if _bg_task_ui("pipeline_run", f"Pipeline – {demo_product}"):
                 pass  # rerun already triggered inside _bg_task_ui
@@ -1338,12 +1355,12 @@ elif page == "⚙️ Pipelines":
 
                     def _run_pipeline(phases, product, limit):
                         import requests as _rq
-                        for phase_name, url, loop in phases:
+                        for phase_name, url, loop, timeout in phases:
                             grand, call_n, ok = 0, 0, True
                             while True:
                                 call_n += 1
                                 try:
-                                    r = _rq.post(url, timeout=300)
+                                    r = _rq.post(url, timeout=timeout)
                                     body = r.json() if "json" in r.headers.get("content-type", "") else {}
                                     if r.status_code != 200:
                                         _bg_log("pipeline_run", f"⚠️ {phase_name}: HTTP {r.status_code}")
