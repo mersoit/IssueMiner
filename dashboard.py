@@ -93,6 +93,10 @@ st.set_page_config(
 # st.session_state is NOT accessible from background threads.
 # We use a plain module-level dict (_BG_TASKS) as the shared
 # state store. The main thread reads from it on every rerun.
+#
+# Button-spam prevention: st.session_state["_bg_started_<key>"] is
+# set to True immediately when a task is launched, so the button is
+# disabled on the very next render before _BG_TASKS is even checked.
 
 _BG_TASKS: Dict[str, Any] = {}
 _BG_LOCK = threading.Lock()
@@ -100,6 +104,10 @@ _BG_LOCK = threading.Lock()
 
 def _bg_task_start(task_key: str, fn, *args, **kwargs) -> None:
     """Launch fn(*args, **kwargs) in a daemon thread."""
+    # Mark started in session_state immediately so the button is
+    # disabled on the next render even before the thread writes to _BG_TASKS
+    st.session_state[f"_bg_started_{task_key}"] = True
+
     with _BG_LOCK:
         _BG_TASKS[task_key] = {
             "status":     "running",
@@ -132,12 +140,17 @@ def _bg_log(task_key: str, msg: str) -> None:
 def _bg_task_ui(task_key: str, title: str) -> bool:
     """
     Render status widget for a background task.
-    Returns True while the task is still running (triggers auto-rerun).
+    Returns True while the task is still running.
+    Auto-refreshes the page every 3 seconds via a meta-refresh tag
+    (no sleep — does not block the Streamlit thread).
     """
+    # Sync: if task finished, clear the session_state started flag
     with _BG_LOCK:
         state = dict(_BG_TASKS.get(task_key) or {})
 
     if not state:
+        # Task not in _BG_TASKS — could be cleared or never started
+        st.session_state.pop(f"_bg_started_{task_key}", None)
         return False
 
     status = state.get("status", "unknown")
@@ -148,9 +161,15 @@ def _bg_task_ui(task_key: str, title: str) -> bool:
         if log:
             with st.expander("Live log", expanded=True):
                 st.text("\n".join(log[-40:]))
-        time.sleep(2)
-        st.rerun()
+        # Auto-refresh every 3 seconds without blocking the thread
+        st.markdown(
+            '<meta http-equiv="refresh" content="3">',
+            unsafe_allow_html=True,
+        )
         return True
+
+    # Task finished — clear started flag so button re-enables
+    st.session_state.pop(f"_bg_started_{task_key}", None)
 
     if status == "done":
         st.success(f"✅ **{title}** complete.")
@@ -182,12 +201,15 @@ def _bg_task_ui(task_key: str, title: str) -> bool:
 
 
 def _is_bg_running(task_key: str) -> bool:
+    """Check _BG_TASKS first, fall back to session_state started flag."""
     with _BG_LOCK:
-        return _BG_TASKS.get(task_key, {}).get("status") == "running"
+        if _BG_TASKS.get(task_key, {}).get("status") == "running":
+            return True
+    # Fallback: thread started but hasn't written to _BG_TASKS yet
+    return bool(st.session_state.get(f"_bg_started_{task_key}"))
 
 
 # ─────────────────────────────────────────────────────────
-# Cached DB connection
 # ─────────────────────────────────────────────────────────
 @st.cache_resource(ttl=300)
 def _get_cnx():
@@ -1372,9 +1394,11 @@ elif page == "⚙️ Pipelines":
             # Tuple: (name, url, loop_until_empty, per_call_timeout_secs)
 
             if _bg_task_ui("pipeline_run", f"Pipeline – {demo_product}"):
-                pass  # rerun already triggered inside _bg_task_ui
+                pass  # meta-refresh handles polling
             elif not _is_bg_running("pipeline_run"):
-                if st.button("▶️ Run All Phases", key="demo_run", use_container_width=True):
+                if st.button("▶️ Run All Phases", key="demo_run",
+                             use_container_width=True,
+                             disabled=_is_bg_running("pipeline_run")):
                     import requests as _req
 
                     def _run_pipeline(phases, product, limit):
