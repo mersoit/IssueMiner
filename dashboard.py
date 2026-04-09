@@ -1214,19 +1214,28 @@ elif page == "⚙️ Pipelines":
 
             _FUNC_BASE = "http://localhost:7071/api"
             _b = f"&batch_id={demo_batch_id.strip()}" if demo_batch_id.strip() else ""
+
+            # Phases that need a loop (can run long): (name, base_url, loop_param)
+            # loop_param = the param name whose value tells us how many were processed this call
+            _LOOPING_PHASES = {
+                "Phase 1B – Cluster":         f"{_FUNC_BASE}/phase1b_cluster?product={demo_product}&batch_size=10&max_batches=20{_b}",
+                "Phase 1C – Emergent cluster": f"{_FUNC_BASE}/phase1c_emergent_cluster?product={demo_product}&batch_size=10&limit=50{_b}",
+            }
+
             demo_phases = [
-                ("Phase 1B – Cluster",         f"{_FUNC_BASE}/phase1b_cluster?product={demo_product}{_b}"),
-                ("Phase 1C – Emergent cluster", f"{_FUNC_BASE}/phase1c_emergent_cluster?product={demo_product}{_b}"),
-                ("Phase 2E – Assign leaf",     f"{_FUNC_BASE}/phase2e_assign_leaf?limit={demo_limit}&product={demo_product}{_b}"),
-                ("Phase 2F – Emergent detect", f"{_FUNC_BASE}/phase2f_detect_emergent?limit={demo_limit}{_b}"),
-                ("Phase 2G – Count leaves",    f"{_FUNC_BASE}/phase2g_count_leaves?product={demo_product}"),
-                ("Phase 3 – Common playbooks", f"{_FUNC_BASE}/phase3_common?limit={demo_limit}&product={demo_product}"),
-                ("Phase 3 – Push to wiki",     f"{_FUNC_BASE}/phase3_push?limit={demo_limit}"),
-                ("Phase 4A – Nuggets",         f"{_FUNC_BASE}/phase4a_nugget_mining?limit={demo_limit}&product={demo_product}{_b}"),
-                ("Phase 4B – Variants wiki",   f"{_FUNC_BASE}/phase4b_populate_variants?limit={demo_limit}&product={demo_product}"),
-                ("Phase 4C – Scenarios wiki",  f"{_FUNC_BASE}/phase4c_populate_scenarios?limit={demo_limit}&product={demo_product}"),
-                ("Phase 4D – Topics wiki",     f"{_FUNC_BASE}/phase4d_populate_topics?limit={demo_limit}&product={demo_product}"),
+                ("Phase 1B – Cluster",         _LOOPING_PHASES["Phase 1B – Cluster"],         True),
+                ("Phase 1C – Emergent cluster", _LOOPING_PHASES["Phase 1C – Emergent cluster"], False),
+                ("Phase 2E – Assign leaf",     f"{_FUNC_BASE}/phase2e_assign_leaf?batch_size=10&max_batches=20&product={demo_product}{_b}", True),
+                ("Phase 2F – Emergent detect", f"{_FUNC_BASE}/phase2f_detect_emergent?batch_size=10&max_batches=20{_b}", False),
+                ("Phase 2G – Count leaves",    f"{_FUNC_BASE}/phase2g_count_leaves?product={demo_product}",                              False),
+                ("Phase 3 – Common playbooks", f"{_FUNC_BASE}/phase3_common?limit={demo_limit}&product={demo_product}",                  False),
+                ("Phase 3 – Push to wiki",     f"{_FUNC_BASE}/phase3_push?limit={demo_limit}",                                          False),
+                ("Phase 4A – Nuggets",         f"{_FUNC_BASE}/phase4a_nugget_mining?limit={demo_limit}&product={demo_product}{_b}",      False),
+                ("Phase 4B – Variants wiki",   f"{_FUNC_BASE}/phase4b_populate_variants?limit={demo_limit}&product={demo_product}",      False),
+                ("Phase 4C – Scenarios wiki",  f"{_FUNC_BASE}/phase4c_populate_scenarios?limit={demo_limit}&product={demo_product}",     False),
+                ("Phase 4D – Topics wiki",     f"{_FUNC_BASE}/phase4d_populate_topics?limit={demo_limit}&product={demo_product}",        False),
             ]
+            # (name, url, loop_until_empty)
 
             if st.button("▶️ Run All Phases", key="demo_run", use_container_width=True):
                 import requests as _req
@@ -1234,22 +1243,37 @@ elif page == "⚙️ Pipelines":
                 log_area = st.empty()
                 run_logs = []
 
-                for i, (phase_name, url) in enumerate(demo_phases):
-                    progress.progress((i) / len(demo_phases), text=f"Running {phase_name}…")
-                    try:
-                        r = _req.post(url, timeout=600)
+                for i, (phase_name, url, loop) in enumerate(demo_phases):
+                    progress.progress(i / len(demo_phases), text=f"Running {phase_name}…")
+                    grand = 0
+                    call_n = 0
+                    ok = True
+                    while True:
+                        call_n += 1
                         try:
-                            body = r.json()
-                        except Exception:
-                            body = r.text[:300]
-                        if r.status_code == 200:
-                            processed = body.get("processed", body.get("ingested", "?")) if isinstance(body, dict) else "?"
-                            run_logs.append(f"✅ {phase_name}: OK (processed={processed})")
-                        else:
-                            run_logs.append(f"⚠️ {phase_name}: HTTP {r.status_code} — {str(body)[:200]}")
-                    except Exception as ex:
-                        run_logs.append(f"❌ {phase_name}: {ex}")
-
+                            r = _req.post(url, timeout=300)
+                            try:
+                                body = r.json()
+                            except Exception:
+                                body = r.text[:300]
+                            if r.status_code != 200:
+                                run_logs.append(f"⚠️ {phase_name}: HTTP {r.status_code} — {str(body)[:200]}")
+                                ok = False
+                                break
+                            processed = int(body.get("processed", body.get("ingested", 0)) or 0) if isinstance(body, dict) else 0
+                            grand += processed
+                            log_area.markdown("\n".join(f"- {l}" for l in run_logs) +
+                                              f"\n- ⏳ {phase_name}: call {call_n}, processed so far: {grand}")
+                            # Stop looping if not a looping phase, or if nothing came back
+                            if not loop or processed == 0:
+                                break
+                        except Exception as ex:
+                            run_logs.append(f"❌ {phase_name}: {ex}")
+                            ok = False
+                            break
+                    if ok:
+                        suffix = f" ({call_n} calls)" if call_n > 1 else ""
+                        run_logs.append(f"✅ {phase_name}: OK (processed={grand}){suffix}")
                     log_area.markdown("\n".join(f"- {l}" for l in run_logs))
 
                 progress.progress(1.0, text="Done.")
