@@ -1358,30 +1358,40 @@ elif page == "⚙️ Pipelines":
             # Tuple: (display_name, url, loop_until_empty, per_call_timeout_secs)
             _batch = min(int(demo_limit), 20)   # safe per-call limit for LLM-heavy phases
             demo_phases = [
+                # ── Catalog building ──────────────────────────────────────────
                 ("Phase 1B – Cluster",
                  f"{_FUNC_BASE}/phase1b_cluster?product={demo_product}&batch_size=10&max_batches=20{_b}",
                  True,  240),
                 ("Phase 1C – Emergent cluster",
                  f"{_FUNC_BASE}/phase1c_emergent_cluster?product={demo_product}&batch_size=10&limit=50{_b}",
                  False, 120),
+                # ── Leaf assignment (needs 1B catalog complete first) ─────────
                 ("Phase 2E – Assign leaf",
                  f"{_FUNC_BASE}/phase2e_assign_leaf?batch_size=10&max_batches=20&product={demo_product}{_b}",
                  True,  240),
                 ("Phase 2F – Emergent detect",
                  f"{_FUNC_BASE}/phase2f_detect_emergent?batch_size=10&max_batches=20{_b}",
                  False, 120),
+                # ── Count leaves BEFORE wiki/playbook phases ──────────────────
                 ("Phase 2G – Count leaves",
                  f"{_FUNC_BASE}/phase2g_count_leaves?product={demo_product}",
                  False,  60),
+                # ── Nugget mining (runs on raw threads, before playbooks) ──────
+                ("Phase 4A – Nuggets",
+                 f"{_FUNC_BASE}/phase4a_nugget_mining?limit={_batch}&product={demo_product}{_b}",
+                 True,  120),
+                # ── Playbook generation (needs leaf counts + nuggets) ─────────
                 ("Phase 3 – Common playbooks",
                  f"{_FUNC_BASE}/phase3_common?limit={_batch}&product={demo_product}&{_p3_thresh}",
                  True,  180),
                 ("Phase 3 – Push to wiki",
                  f"{_FUNC_BASE}/phase3_push?limit={demo_limit}",
                  False, 120),
-                ("Phase 4A – Nuggets",
-                 f"{_FUNC_BASE}/phase4a_nugget_mining?limit={_batch}&product={demo_product}{_b}",
-                 True,  120),
+                # ── Wiki population (needs playbooks + leaf counts) ───────────
+                # Re-run 2G so member_count reflects any new assignments
+                ("Phase 2G – Count leaves (refresh)",
+                 f"{_FUNC_BASE}/phase2g_count_leaves?product={demo_product}",
+                 False,  60),
                 ("Phase 4B – Variants wiki",
                  f"{_FUNC_BASE}/phase4b_populate_variants?limit={_batch}&product={demo_product}&{_p4b_thresh}",
                  True,  180),

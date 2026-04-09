@@ -427,6 +427,47 @@ _PRODUCT_ALIASES: Dict[str, str] = {
     "Windows IIS": "Internet Information Services",
 }
 
+# Products that frequently appear in IIS Q&A threads but are actually separate products.
+# If the LLM returns one of these for an IIS-tagged thread, we trust the LLM — the
+# thread is about that product, not IIS.
+_CROSS_PRODUCT_SIGNALS: Dict[str, List[str]] = {
+    # signal tokens (lowercase) -> canonical product
+    "application gateway":    ["application gateway", "app gateway", "appgw", "waf policy", "backend probe"],
+    "Application Gateway":    ["Application Gateway"],
+    "Virtual Network":        ["vnet integration", "nsg", "udr", "peering"],
+    "AKS":                    ["aks", "kubernetes", "kubectl", "helm"],
+    "ARM":                    ["arm template", "bicep", "resource manager"],
+    "Front Door":             ["front door", "afd", "cdn profile"],
+    "Load Balancer":          ["load balancer", "nlb", "slb"],
+}
+
+
+def _detect_cross_product(
+    raw_llm_product: str,
+    signature_text: str,
+    known_products: List[str],
+) -> Optional[str]:
+    """
+    If the LLM assigned a product (e.g. IIS) but the thread signature clearly
+    signals a different known product, return that product instead.
+    Returns None if no strong cross-product signal is detected.
+    """
+    sig_lower = (signature_text or "").lower()
+    raw_lower = raw_llm_product.lower()
+
+    for canonical, signals in _CROSS_PRODUCT_SIGNALS.items():
+        # Skip if the LLM already picked this product
+        if canonical.lower() == raw_lower:
+            continue
+        # Skip if this canonical isn't in the known product list
+        if not any(canonical.lower() == kp.lower() for kp in known_products):
+            continue
+        # Check if any signal phrase appears in the thread signature
+        if any(sig in sig_lower for sig in signals):
+            return canonical
+    return None
+
+
 _SEED_PRODUCTS: List[str] = [
     "APIM", "DevOps", "Web Apps", "Functions", "Static Web Apps",
     "App Service", "Redis", "Storage Account", "Logic Apps",
@@ -606,6 +647,16 @@ def map_llm_to_db_payload(
         lang = "other"
 
     product = _normalize_product(_safe_str(llm_json.get("product", "Other")), known_products, db_aliases)
+
+    # Cross-product bleed guard: if the thread's signature clearly signals a different
+    # known product (e.g. App Gateway thread tagged under IIS), override the assignment.
+    if known_products:
+        sig_text = _safe_str(llm_json.get("signature_text", ""))
+        cross = _detect_cross_product(product, sig_text, known_products)
+        if cross:
+            logging.debug("[1A] cross_product_override thread=%s %s -> %s", thread_id, product, cross)
+            product = cross
+
     if len(product) > 64:
         product = product[:64]
 
