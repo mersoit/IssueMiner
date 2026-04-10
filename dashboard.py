@@ -1400,7 +1400,7 @@ elif page == "⚙️ Pipelines":
                  f"{_FUNC_BASE}/phase4b_populate_variants?limit={_batch}&product={demo_product}&{_p4b_thresh}",
                  True,  240, None),
                 ("Phase 4C – Scenarios wiki",
-                 f"{_FUNC_BASE}/phase4c_populate_scenarios?limit={_batch}&product={demo_product}&{_p4c_thresh}&model=mini",
+                 f"{_FUNC_BASE}/phase4c_populate_scenarios?limit={_batch}&product={demo_product}&{_p4c_thresh}&model=gpt52",
                  True,  240, None),
                 ("Phase 4D – Topics wiki",
                  f"{_FUNC_BASE}/phase4d_populate_topics?limit={_batch}&product={demo_product}&{_p4d_thresh}",

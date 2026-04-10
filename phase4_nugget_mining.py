@@ -409,8 +409,8 @@ def evaluate_nugget_pass2(
         messages=messages,
         response_format={"type": "json_object"},
         max_completion_tokens=_PASS2_MAX_COMPLETION_TOKENS,
-        rate_limiter=get_rate_limiter("mini"),
-        caller_tag="phase4a_pass2",
+        rate_limiter=get_rate_limiter("nano"),
+            caller_tag="phase4a_pass2",
     )
 
     raw_text = (_get_choice_text_any(resp) or "").strip()
@@ -719,8 +719,8 @@ def run_phase4a_nugget_mining(req: func.HttpRequest) -> func.HttpResponse:
         deployment_pass1 = get_mini_deployment()
         logging.info("Phase4A Pass1 model: %s", deployment_pass1)
 
-        client_pass2 = make_mini_client()
-        deployment_pass2 = get_mini_deployment()
+        client_pass2 = make_nano_client()
+        deployment_pass2 = get_nano_deployment()
         logging.info("Phase4A Pass2 model: %s", deployment_pass2)
 
         logging.info("Phase4A submitting %d threads to thread pool (workers=%d)", len(threads), max_workers)

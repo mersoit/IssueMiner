@@ -453,10 +453,10 @@ def generate_gpt5_common_leaf_support_playbook(context: Dict[str, Any]) -> Dict[
     """
     Generates a concise support playbook for a leaf from the perspective of Azure Technical Support.
     Uses threads + retrieved KB articles as evidence, but allows intermediate steps based on domain knowledge.
-    Uses GPT-5 Mini for fast, high-quality playbook generation.
+    Uses GPT-5.2 for high-quality playbook generation.
     """
-    client = make_mini_client()
-    deployment = get_mini_deployment()
+    client = make_gpt52_client()
+    deployment = get_gpt52_deployment()
 
     meta = context.get("meta") or {}
     threads = context.get("threads") or []
@@ -615,15 +615,15 @@ def generate_gpt5_common_leaf_support_playbook(context: Dict[str, Any]) -> Dict[
                 {"role": "user", "content": user_prompt},
             ],
             response_format={"type": "json_object"},
-            max_completion_tokens=int(os.getenv("AOAI_MAX_COMPLETION_TOKENS_MINI", "16000")),
+            max_completion_tokens=int(os.getenv("AOAI_MAX_COMPLETION_TOKENS_GPT52", "16000")),
             temperature=0.2,
             estimated_prompt_tokens=estimate_tokens(system_prompt) + estimate_tokens(user_prompt),
-            rate_limiter=get_rate_limiter("mini"),
-            caller_tag="phase3_leaf_mini",
+            rate_limiter=get_rate_limiter("gpt52"),
+            caller_tag="phase3_leaf_gpt52",
         )
     except Exception as e:
         logging.error(
-            "GPT-5 Pro common_leaf playbook generation failed for cluster %s: %s",
+            "GPT-5.2 common_leaf playbook generation failed for cluster %s: %s",
             meta.get("cluster_id"),
             str(e),
         )
@@ -964,7 +964,7 @@ def run_phase3_common_processing(
             meta = ctx_top4["meta"]
 
             logging.info(
-                "[Phase3] cluster_id=%d (%s) – calling GPT-5 Mini",
+                "[Phase3] cluster_id=%d (%s) – calling GPT-5.2",
                 cid, meta.get("cluster_key", "?"),
             )
 
@@ -972,9 +972,9 @@ def run_phase3_common_processing(
                 output = generate_gpt5_common_leaf_support_playbook(ctx_top4)
             except Exception as e:
                 logging.error(
-                    "[Phase3] cluster_id=%d – Mini call failed: %s", cid, str(e)[:300]
+                    "[Phase3] cluster_id=%d – GPT-5.2 call failed: %s", cid, str(e)[:300]
                 )
-                return {"cid": cid, "status": "mini_error", "error": str(e)}
+                return {"cid": cid, "status": "gpt52_error", "error": str(e)}
 
             content = output.get("content", {})
             if not content or not content.get("title"):
