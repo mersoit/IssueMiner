@@ -610,28 +610,45 @@ def force_reset_batch(cnx: pyodbc.Connection, batch_id: str) -> Dict[str, int]:
 
 
 
-def force_reset_2e_for_product(cnx: pyodbc.Connection, product: str) -> int:
+def force_reset_2e_for_product(cnx: pyodbc.Connection, product: str, new_batch_id: str = "") -> int:
     """
     Reset 2E assignment state for all catalog-checked threads of a given product
     so 2E will re-attempt leaf assignment on the next run.
+    Optionally stamps new_batch_id onto the threads so the next pipeline run
+    (which passes batch_id=new_batch_id) will pick them up.
     Scoped strictly to this product — no other products touched.
     Returns number of rows reset.
     """
     product = (product or "").strip()
     if not product:
         raise ValueError("product is required")
+    new_batch_id = (new_batch_id or "").strip()
     cur = cnx.cursor()
-    cur.execute("""
-        UPDATE dbo.thread_enrichment
-        SET AssignmentStartedUtc    = NULL,
-            AssignmentCompletedUtc  = NULL,
-            TopicClusterID          = NULL,
-            ScenarioClusterID       = NULL,
-            VariantClusterID        = NULL,
-            ResolutionLeafClusterID = NULL
-        WHERE product = ?
-          AND CatalogCheckedUtc IS NOT NULL
-    """, product)
+    if new_batch_id:
+        cur.execute("""
+            UPDATE dbo.thread_enrichment
+            SET AssignmentStartedUtc    = NULL,
+                AssignmentCompletedUtc  = NULL,
+                TopicClusterID          = NULL,
+                ScenarioClusterID       = NULL,
+                VariantClusterID        = NULL,
+                ResolutionLeafClusterID = NULL,
+                batch_id                = ?
+            WHERE product = ?
+              AND CatalogCheckedUtc IS NOT NULL
+        """, new_batch_id, product)
+    else:
+        cur.execute("""
+            UPDATE dbo.thread_enrichment
+            SET AssignmentStartedUtc    = NULL,
+                AssignmentCompletedUtc  = NULL,
+                TopicClusterID          = NULL,
+                ScenarioClusterID       = NULL,
+                VariantClusterID        = NULL,
+                ResolutionLeafClusterID = NULL
+            WHERE product = ?
+              AND CatalogCheckedUtc IS NOT NULL
+        """, product)
     n = int(cur.rowcount or 0)
     cnx.commit()
     return n

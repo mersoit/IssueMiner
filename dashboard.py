@@ -1556,7 +1556,7 @@ elif page == "⚙️ Pipelines":
                     "you re-run 2G + Phase 3 from the pipeline panel above. "
                     "**Scoped strictly to the selected product.**"
                 )
-                r2e_col1, r2e_col2 = st.columns([3, 1])
+                r2e_col1, r2e_col2, r2e_col3 = st.columns([2, 2, 1])
                 with r2e_col1:
                     r2e_product = st.selectbox(
                         "Product to re-assign",
@@ -1564,21 +1564,28 @@ elif page == "⚙️ Pipelines":
                         key="r2e_product_select",
                     )
                 with r2e_col2:
+                    r2e_batch = st.text_input(
+                        "Stamp batch ID (must match current pipeline run)",
+                        placeholder="e.g. batch_20260410_0755",
+                        key="r2e_batch_input",
+                        help="Threads will be re-stamped with this batch_id so the pipeline's 2E call (which filters by batch_id) can pick them up.",
+                    )
+                with r2e_col3:
                     st.markdown("&nbsp;", unsafe_allow_html=True)
                     do_r2e = st.button(
                         "🔧 Reset 2E",
                         key="r2e_btn",
                         use_container_width=True,
-                        disabled=not r2e_product,
-                        help="Clears 2E assignments for this product only. Run 2E → 2G → Phase3 after.",
+                        disabled=not (r2e_product and r2e_batch.strip()),
+                        help="Clears 2E assignments and re-stamps batch_id. Run 2E → 2G → Phase3 after.",
                     )
-                if do_r2e and r2e_product:
+                if do_r2e and r2e_product and r2e_batch.strip():
                     try:
-                        n = force_reset_2e_for_product(cnx, r2e_product)
+                        n = force_reset_2e_for_product(cnx, r2e_product, r2e_batch.strip())
                         st.success(
-                            f"✅ Reset **{n}** threads for **{r2e_product}**. "
-                            f"Now re-run the pipeline with product = `{r2e_product}` "
-                            f"starting from Phase 2E (or run the full pipeline)."
+                            f"✅ Reset **{n}** threads for **{r2e_product}**, stamped `batch_id={r2e_batch.strip()}`. "
+                            f"Now re-run the pipeline with Batch ID = `{r2e_batch.strip()}` "
+                            f"starting from Phase 2E."
                         )
                     except Exception as e:
                         st.error(f"2E reset failed: {e}")
