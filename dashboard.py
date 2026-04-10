@@ -1351,58 +1351,62 @@ elif page == "⚙️ Pipelines":
 
             # Demo-mode threshold overrides
             _p3_thresh  = "min_members=1&min_usefulness=0.3"          if demo_mode else "min_members=2&min_usefulness=0.6"
-            _p4b_thresh = "min_members=1&min_usefulness=0.1"          if demo_mode else "min_members=3&min_usefulness=0.4"
-            _p4c_thresh = "min_members=1&child_min_members=1"         if demo_mode else "min_members=6&child_min_members=3"
-            _p4d_thresh = "min_members=1&require_child_wiki=0"        if demo_mode else "min_members=1&require_child_wiki=1"
+            _p4b_thresh = "min_members=0&min_usefulness=0.0"          if demo_mode else "min_members=3&min_usefulness=0.4"
+            _p4c_thresh = "min_members=0&child_min_members=0"         if demo_mode else "min_members=6&child_min_members=3"
+            _p4d_thresh = "min_members=0&require_child_wiki=0"        if demo_mode else "min_members=1&require_child_wiki=1"
 
             # Tuple: (display_name, url, loop_until_empty, per_call_timeout_secs)
             _batch = min(int(demo_limit), 20)   # safe per-call limit for LLM-heavy phases
+
+            # 1B and 2E must interleave: after every 1B call, run 2E once so newly
+            # catalog-checked threads get leaf-assigned before the next 1B batch.
+            # We encode this as a special sentinel in the phase list.
+            _1b_url = f"{_FUNC_BASE}/phase1b_cluster?product={demo_product}&batch_size=10&max_batches=20{_b}"
+            _2e_url = f"{_FUNC_BASE}/phase2e_assign_leaf?batch_size=10&max_batches=20&product={demo_product}{_b}"
+
             demo_phases = [
-                # ── Catalog building ──────────────────────────────────────────
-                ("Phase 1B – Cluster",
-                 f"{_FUNC_BASE}/phase1b_cluster?product={demo_product}&batch_size=10&max_batches=20{_b}",
-                 True,  240),
+                # ── Catalog build + leaf assignment (interleaved) ─────────────
+                # Special tuple with 5th element "interleave": after each 1B call
+                # that returns processed>0, a 2E call is fired before the next 1B.
+                ("Phase 1B – Cluster",       _1b_url, True,  240, _2e_url),
                 ("Phase 1C – Emergent cluster",
                  f"{_FUNC_BASE}/phase1c_emergent_cluster?product={demo_product}&batch_size=10&limit=50{_b}",
-                 False, 120),
-                # ── Leaf assignment (needs 1B catalog complete first) ─────────
-                ("Phase 2E – Assign leaf",
-                 f"{_FUNC_BASE}/phase2e_assign_leaf?batch_size=10&max_batches=20&product={demo_product}{_b}",
-                 True,  240),
+                 False, 120, None),
+                # Final 2E drain after 1B fully done
+                ("Phase 2E – Assign leaf (final drain)", _2e_url, True,  240, None),
                 ("Phase 2F – Emergent detect",
                  f"{_FUNC_BASE}/phase2f_detect_emergent?batch_size=10&max_batches=20{_b}",
-                 False, 120),
+                 False, 120, None),
                 # ── Count leaves BEFORE wiki/playbook phases ──────────────────
                 ("Phase 2G – Count leaves",
                  f"{_FUNC_BASE}/phase2g_count_leaves?product={demo_product}",
-                 False,  60),
-                # ── Nugget mining (runs on raw threads, before playbooks) ──────
+                 False,  60, None),
+                # ── Nugget mining ─────────────────────────────────────────────
                 ("Phase 4A – Nuggets",
                  f"{_FUNC_BASE}/phase4a_nugget_mining?limit={_batch}&product={demo_product}{_b}",
-                 True,  240),
-                # ── Playbook generation (needs leaf counts + nuggets) ─────────
+                 True,  240, None),
+                # ── Playbook generation ───────────────────────────────────────
                 ("Phase 3 – Common playbooks",
                  f"{_FUNC_BASE}/phase3_common?limit={_batch}&product={demo_product}&{_p3_thresh}",
-                 True,  180),
+                 True,  240, None),
                 ("Phase 3 – Push to wiki",
                  f"{_FUNC_BASE}/phase3_push?limit={demo_limit}",
-                 False, 120),
-                # ── Wiki population (needs playbooks + leaf counts) ───────────
-                # Re-run 2G so member_count reflects any new assignments
+                 False, 120, None),
+                # ── Wiki population ───────────────────────────────────────────
                 ("Phase 2G – Count leaves (refresh)",
                  f"{_FUNC_BASE}/phase2g_count_leaves?product={demo_product}",
-                 False,  60),
+                 False,  60, None),
                 ("Phase 4B – Variants wiki",
                  f"{_FUNC_BASE}/phase4b_populate_variants?limit={_batch}&product={demo_product}&{_p4b_thresh}",
-                 True,  180),
+                 True,  240, None),
                 ("Phase 4C – Scenarios wiki",
-                 f"{_FUNC_BASE}/phase4c_populate_scenarios?limit={_batch}&product={demo_product}&{_p4c_thresh}",
-                 True,  180),
+                 f"{_FUNC_BASE}/phase4c_populate_scenarios?limit={_batch}&product={demo_product}&{_p4c_thresh}&model=mini",
+                 True,  240, None),
                 ("Phase 4D – Topics wiki",
                  f"{_FUNC_BASE}/phase4d_populate_topics?limit={_batch}&product={demo_product}&{_p4d_thresh}",
-                 True,  180),
+                 True,  240, None),
             ]
-            # Tuple: (name, url, loop_until_empty, per_call_timeout_secs)
+            # Tuple: (name, url, loop_until_empty, per_call_timeout_secs, interleave_url_or_None)
 
             if _bg_task_ui("pipeline_run", f"Pipeline – {demo_product}"):
                 pass  # meta-refresh handles polling
@@ -1414,7 +1418,7 @@ elif page == "⚙️ Pipelines":
 
                     def _run_pipeline(phases, product, limit):
                         import requests as _rq
-                        for phase_name, url, loop, timeout in phases:
+                        for phase_name, url, loop, timeout, interleave_url in phases:
                             grand, call_n, ok = 0, 0, True
                             while True:
                                 call_n += 1
@@ -1427,6 +1431,15 @@ elif page == "⚙️ Pipelines":
                                     processed = int(body.get("processed", body.get("ingested", 0)) or 0)
                                     grand += processed
                                     _bg_log("pipeline_run", f"  {phase_name} call {call_n}: +{processed} (total {grand})")
+                                    # After each productive 1B call, fire a 2E interleave call
+                                    if interleave_url and processed > 0:
+                                        try:
+                                            ri = _rq.post(interleave_url, timeout=timeout)
+                                            bi = ri.json() if "json" in ri.headers.get("content-type", "") else {}
+                                            pi = int(bi.get("processed", 0) or 0)
+                                            _bg_log("pipeline_run", f"    ↳ 2E interleave: assigned={pi}")
+                                        except Exception as ie:
+                                            _bg_log("pipeline_run", f"    ↳ 2E interleave error: {ie}")
                                     if not loop or processed == 0:
                                         break
                                 except Exception as ex:

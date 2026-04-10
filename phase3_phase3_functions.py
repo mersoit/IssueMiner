@@ -13,6 +13,8 @@ from ado_devops import create_work_item, update_work_item, upsert_wiki_page
 from aoai_helpers import (
     make_gpt52_client,
     get_gpt52_deployment,
+    make_mini_client,
+    get_mini_deployment,
     make_pro_client,
     get_pro_deployment,
     call_aoai_with_retry,
@@ -451,10 +453,10 @@ def generate_gpt5_common_leaf_support_playbook(context: Dict[str, Any]) -> Dict[
     """
     Generates a concise support playbook for a leaf from the perspective of Azure Technical Support.
     Uses threads + retrieved KB articles as evidence, but allows intermediate steps based on domain knowledge.
-    Uses GPT-5 Pro for highest quality reasoning on playbook generation.
+    Uses GPT-5 Mini for fast, high-quality playbook generation.
     """
-    client = make_pro_client()
-    deployment = get_pro_deployment()
+    client = make_mini_client()
+    deployment = get_mini_deployment()
 
     meta = context.get("meta") or {}
     threads = context.get("threads") or []
@@ -605,19 +607,19 @@ def generate_gpt5_common_leaf_support_playbook(context: Dict[str, Any]) -> Dict[
     )
 
     try:
-        # GPT-5 Pro wrapper: do NOT rely on response_format=json_object for Pro.
-        # The prompt already requires strict JSON; helper parses best-effort.
-        return call_pro_json_with_retry(
+        return call_aoai_with_retry(
             client,
             model=deployment,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            max_completion_tokens=int(os.getenv("AOAI_MAX_COMPLETION_TOKENS_PRO", "16000")),
+            response_format={"type": "json_object"},
+            max_completion_tokens=int(os.getenv("AOAI_MAX_COMPLETION_TOKENS_MINI", "16000")),
             temperature=0.2,
-            rate_limiter=get_rate_limiter("pro"),
-            caller_tag="phase3_leaf_pro",
+            estimated_prompt_tokens=estimate_tokens(system_prompt) + estimate_tokens(user_prompt),
+            rate_limiter=get_rate_limiter("mini"),
+            caller_tag="phase3_leaf_mini",
         )
     except Exception as e:
         logging.error(
@@ -948,12 +950,12 @@ def run_phase3_common_processing(
             )
 
         logging.info(
-            "[Phase3] Common leaf processing: %d candidates gathered, starting Pro pool",
+            "[Phase3] Common leaf processing: %d candidates gathered, starting Mini pool",
             len(work_items),
         )
 
         # ----------------------------------------------------------
-        # 2) Parallel GPT-5 Pro calls via slow-start pool
+        # 2) Parallel GPT-5 Mini calls (no slow-start needed)
         # ----------------------------------------------------------
         def _generate_playbook(item: Dict[str, Any]) -> Dict[str, Any]:
             cid = item["cid"]
@@ -962,7 +964,7 @@ def run_phase3_common_processing(
             meta = ctx_top4["meta"]
 
             logging.info(
-                "[Phase3] cluster_id=%d (%s) – calling GPT-5 Pro",
+                "[Phase3] cluster_id=%d (%s) – calling GPT-5 Mini",
                 cid, meta.get("cluster_key", "?"),
             )
 
@@ -970,9 +972,9 @@ def run_phase3_common_processing(
                 output = generate_gpt5_common_leaf_support_playbook(ctx_top4)
             except Exception as e:
                 logging.error(
-                    "[Phase3] cluster_id=%d – Pro call failed: %s", cid, str(e)[:300]
+                    "[Phase3] cluster_id=%d – Mini call failed: %s", cid, str(e)[:300]
                 )
-                return {"cid": cid, "status": "pro_error", "error": str(e)}
+                return {"cid": cid, "status": "mini_error", "error": str(e)}
 
             content = output.get("content", {})
             if not content or not content.get("title"):
@@ -993,14 +995,20 @@ def run_phase3_common_processing(
                 "docs": docs,
             }
 
-        pool = ProWorkerPool(
-            max_workers=int(os.getenv("PHASE3_PRO_MAX_WORKERS", "8")),
-            initial_workers=int(os.getenv("PHASE3_PRO_INITIAL_WORKERS", "4")),
-            ramp_interval=float(os.getenv("PHASE3_PRO_RAMP_INTERVAL", "70")),
-            ramp_step=int(os.getenv("PHASE3_PRO_RAMP_STEP", "4")),
-            caller_tag="phase3_common",
-        )
-        pro_results = pool.run(work_items, _generate_playbook)
+        pool_workers = min(len(work_items), int(os.getenv("PHASE3_MINI_MAX_WORKERS", "8")))
+        logging.info("[phase3_common] Starting mini pool: %d items, workers=%d", len(work_items), pool_workers)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        futures_map = {}
+        with ThreadPoolExecutor(max_workers=pool_workers) as executor:
+            for item in work_items:
+                futures_map[executor.submit(_generate_playbook, item)] = item["cid"]
+            pro_results = []
+            for fut in as_completed(futures_map):
+                try:
+                    pro_results.append(fut.result())
+                except Exception as e:
+                    pro_results.append({"cid": futures_map[fut], "status": "worker_error", "error": str(e)})
+        logging.info("[phase3_common] Pool complete: %d results", len(pro_results))
 
         # ----------------------------------------------------------
         # 3) Serial DB writes (safe, single connection)

@@ -64,8 +64,8 @@ _MAX_WORKERS = int(os.getenv("PHASE4C_MAX_WORKERS", "4"))
 _MAX_COMPLETION_TOKENS = int(os.getenv("PHASE4C_MAX_TOKENS", "16000"))
 _BATCH_SIZE = int(os.getenv("PHASE4C_BATCH_SIZE", "50"))
 
-# Default model tier: "pro" or "gpt52"
-_DEFAULT_MODEL = os.getenv("PHASE4C_MODEL", "gpt52").strip().lower()
+# Default model tier: "mini" or "gpt52"
+_DEFAULT_MODEL = os.getenv("PHASE4C_MODEL", "mini").strip().lower()
 
 
 # ---------------------------------------------------------
@@ -931,8 +931,11 @@ def run_phase4c_populate_scenarios(req: func.HttpRequest) -> func.HttpResponse:
             client = make_gpt52_client()
             deployment = get_gpt52_deployment()
         else:
-            client = make_pro_client()
-            deployment = get_pro_deployment()
+            # default: mini
+            from aoai_helpers import make_mini_client, get_mini_deployment
+            client = make_mini_client()
+            deployment = get_mini_deployment()
+            model_tier = "mini"
 
         logging.info("[4C] model_tier=%s deployment=%s", model_tier, deployment)
 
