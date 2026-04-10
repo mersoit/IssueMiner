@@ -64,6 +64,8 @@ from dashboard_db import (
     merge_enrichment_products,
     create_batch,
     list_batches,
+    force_reset_batch,
+    list_batch_ids,
 )
 
 # Seed list mirrored from phase1a_enricher._SEED_PRODUCTS — used for UI dropdowns
@@ -1451,3 +1453,59 @@ elif page == "⚙️ Pipelines":
 
                     _bg_task_start("pipeline_run", _run_pipeline, demo_phases, demo_product, demo_limit)
                     st.rerun()
+
+            # ── Force Reprocess Batch ─────────────────────────────────────────
+            st.divider()
+            with st.expander("🔄 Force Reprocess a Batch (undo a bad run)", expanded=False):
+                st.caption(
+                    "Resets processing timestamps for a specific batch so the pipeline will "
+                    "reprocess only those threads. "
+                    "Affects: 1A (re-enrich), 1B (re-catalog), 2E (re-assign leaf), "
+                    "4A (re-mine nuggets + deletes existing nuggets). "
+                    "**Does NOT touch Phase 3 / 4B / 4C / 4D** — cluster-level wiki content "
+                    "is not batch-scoped and resetting it would affect other products."
+                )
+
+                try:
+                    available_batches = list_batch_ids(cnx)
+                except Exception:
+                    available_batches = []
+
+                fr_col1, fr_col2 = st.columns([3, 1])
+                with fr_col1:
+                    if available_batches:
+                        force_batch_id = st.selectbox(
+                            "Select batch to reprocess",
+                            available_batches,
+                            key="force_batch_select",
+                        )
+                    else:
+                        force_batch_id = st.text_input(
+                            "Batch ID to reprocess",
+                            placeholder="e.g. batch_20250601_1400",
+                            key="force_batch_manual",
+                        )
+                with fr_col2:
+                    st.markdown("&nbsp;", unsafe_allow_html=True)
+                    do_force = st.button(
+                        "🔄 Reset Batch",
+                        key="force_batch_btn",
+                        use_container_width=True,
+                        disabled=not (force_batch_id or "").strip(),
+                        help="Resets 1A/1B/2E/4A timestamps for this batch only. Run the pipeline again after.",
+                    )
+
+                if do_force and (force_batch_id or "").strip():
+                    try:
+                        result = force_reset_batch(cnx, force_batch_id.strip())
+                        st.success(
+                            f"✅ Batch **{result['batch_id']}** reset:\n"
+                            f"- 1A (re-enrich): **{result['reset_1a']}** threads\n"
+                            f"- 1B (re-catalog): **{result['reset_1b']}** threads\n"
+                            f"- 2E (re-assign): **{result['reset_2e']}** threads\n"
+                            f"- 4A flag reset: **{result['reset_4a_flag']}** threads, "
+                            f"deleted **{result['deleted_nuggets']}** nugget rows\n\n"
+                            f"Now run the pipeline with Batch ID = `{result['batch_id']}` to reprocess."
+                        )
+                    except Exception as e:
+                        st.error(f"Reset failed: {e}")

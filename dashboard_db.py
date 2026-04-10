@@ -551,6 +551,102 @@ def merge_enrichment_products(
 
 
 # ─────────────────────────────────────────────────────────
+# Batch force-reset (reprocess a specific batch_id only)
+# ─────────────────────────────────────────────────────────
+
+def force_reset_batch(cnx: pyodbc.Connection, batch_id: str) -> Dict[str, int]:
+    """
+    Reset all per-thread processing timestamps for a specific batch_id so the
+    pipeline phases will reprocess only those threads.
+
+    Scopes STRICTLY to batch_id — no other threads are touched.
+
+    Resets:
+      - 1A: EnrichedUtc (re-enrich)
+      - 1B: CatalogCheckedUtc (re-catalog)
+      - 2E: AssignmentStartedUtc, AssignmentCompletedUtc (re-assign leaf)
+      - 4A: NuggetsMinedUtc (re-mine nuggets) + deletes existing nugget rows
+
+    Does NOT touch Phase 3 / 4B / 4C / 4D — those are cluster-level, not
+    batch-scoped, and resetting them could corrupt data for other products.
+    """
+    if not batch_id or not batch_id.strip():
+        raise ValueError("batch_id is required for force reset")
+    batch_id = batch_id.strip()
+
+    cur = cnx.cursor()
+
+    # 1A — re-enrich
+    cur.execute("""
+        UPDATE dbo.thread_enrichment
+        SET EnrichedUtc = NULL
+        WHERE batch_id = ?
+    """, batch_id)
+    reset_1a = int(cur.rowcount or 0)
+
+    # 1B — re-catalog
+    cur.execute("""
+        UPDATE dbo.thread_enrichment
+        SET CatalogCheckedUtc = NULL
+        WHERE batch_id = ?
+    """, batch_id)
+    reset_1b = int(cur.rowcount or 0)
+
+    # 2E — re-assign leaf
+    cur.execute("""
+        UPDATE dbo.thread_enrichment
+        SET AssignmentStartedUtc  = NULL,
+            AssignmentCompletedUtc = NULL,
+            TopicClusterID         = NULL,
+            ScenarioClusterID      = NULL,
+            VariantClusterID       = NULL,
+            ResolutionLeafClusterID = NULL
+        WHERE batch_id = ?
+    """, batch_id)
+    reset_2e = int(cur.rowcount or 0)
+
+    # 4A — re-mine nuggets: clear flag + delete existing nugget rows
+    cur.execute("""
+        UPDATE dbo.thread_enrichment
+        SET NuggetsMinedUtc = NULL
+        WHERE batch_id = ?
+    """, batch_id)
+    reset_4a_flag = int(cur.rowcount or 0)
+
+    cur.execute("""
+        DELETE FROM dbo.KnowledgeNuggets
+        WHERE ThreadID IN (
+            SELECT thread_id FROM dbo.thread_enrichment WHERE batch_id = ?
+        )
+    """, batch_id)
+    deleted_nuggets = int(cur.rowcount or 0)
+
+    cnx.commit()
+
+    return {
+        "batch_id":        batch_id,
+        "reset_1a":        reset_1a,
+        "reset_1b":        reset_1b,
+        "reset_2e":        reset_2e,
+        "reset_4a_flag":   reset_4a_flag,
+        "deleted_nuggets": deleted_nuggets,
+    }
+
+
+def list_batch_ids(cnx: pyodbc.Connection, limit: int = 50) -> List[str]:
+    """Return distinct batch_ids that have threads, newest first."""
+    cur = cnx.cursor()
+    cur.execute("""
+        SELECT TOP (?) batch_id
+        FROM dbo.thread_enrichment
+        WHERE batch_id IS NOT NULL AND LTRIM(RTRIM(batch_id)) <> ''
+        GROUP BY batch_id
+        ORDER BY MAX(ingested_at) DESC
+    """, int(limit))
+    return [str(row[0]) for row in cur.fetchall()]
+
+
+# ─────────────────────────────────────────────────────────
 # Products CRUD  (dashboard crawl targets — human-managed)
 # ─────────────────────────────────────────────────────────
 
