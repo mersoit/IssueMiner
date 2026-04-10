@@ -610,7 +610,34 @@ def force_reset_batch(cnx: pyodbc.Connection, batch_id: str) -> Dict[str, int]:
 
 
 
-def force_reset_wiki_for_batch(cnx, batch_id: str, product: str) -> dict:
+def force_reset_2e_for_product(cnx: pyodbc.Connection, product: str) -> int:
+    """
+    Reset 2E assignment state for all catalog-checked threads of a given product
+    so 2E will re-attempt leaf assignment on the next run.
+    Scoped strictly to this product — no other products touched.
+    Returns number of rows reset.
+    """
+    product = (product or "").strip()
+    if not product:
+        raise ValueError("product is required")
+    cur = cnx.cursor()
+    cur.execute("""
+        UPDATE dbo.thread_enrichment
+        SET AssignmentStartedUtc    = NULL,
+            AssignmentCompletedUtc  = NULL,
+            TopicClusterID          = NULL,
+            ScenarioClusterID       = NULL,
+            VariantClusterID        = NULL,
+            ResolutionLeafClusterID = NULL
+        WHERE product = ?
+          AND CatalogCheckedUtc IS NOT NULL
+    """, product)
+    n = int(cur.rowcount or 0)
+    cnx.commit()
+    return n
+
+
+def force_reset_wiki_for_batch(cnx, batch_id: str,
     """
     Clear wiki/playbook content on catalog clusters touched EXCLUSIVELY by
     this batch+product. If any thread from another batch maps to the same

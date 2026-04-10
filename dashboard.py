@@ -66,6 +66,7 @@ from dashboard_db import (
     list_batches,
     force_reset_batch,
     force_reset_wiki_for_batch,
+    force_reset_2e_for_product,
     list_batch_ids,
 )
 
@@ -1543,3 +1544,41 @@ elif page == "⚙️ Pipelines":
                         )
                     except Exception as e:
                         st.error(f"Wiki reset failed: {e}")
+
+            # ── Repair 2E assignments for a product ──────────────────────────
+            st.divider()
+            with st.expander("🔧 Re-run 2E leaf assignment for a product", expanded=False):
+                st.caption(
+                    "Use this when a product's threads were catalog-checked (1B ran) but "
+                    "2E ran too early and produced bad/missing assignments. "
+                    "Resets AssignmentStartedUtc / AssignmentCompletedUtc and all cluster ID "
+                    "columns for every catalog-checked thread of the selected product, then "
+                    "you re-run 2G + Phase 3 from the pipeline panel above. "
+                    "**Scoped strictly to the selected product.**"
+                )
+                r2e_col1, r2e_col2 = st.columns([3, 1])
+                with r2e_col1:
+                    r2e_product = st.selectbox(
+                        "Product to re-assign",
+                        options=product_names if product_names else [],
+                        key="r2e_product_select",
+                    )
+                with r2e_col2:
+                    st.markdown("&nbsp;", unsafe_allow_html=True)
+                    do_r2e = st.button(
+                        "🔧 Reset 2E",
+                        key="r2e_btn",
+                        use_container_width=True,
+                        disabled=not r2e_product,
+                        help="Clears 2E assignments for this product only. Run 2E → 2G → Phase3 after.",
+                    )
+                if do_r2e and r2e_product:
+                    try:
+                        n = force_reset_2e_for_product(cnx, r2e_product)
+                        st.success(
+                            f"✅ Reset **{n}** threads for **{r2e_product}**. "
+                            f"Now re-run the pipeline with product = `{r2e_product}` "
+                            f"starting from Phase 2E (or run the full pipeline)."
+                        )
+                    except Exception as e:
+                        st.error(f"2E reset failed: {e}")

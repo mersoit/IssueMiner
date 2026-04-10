@@ -899,10 +899,8 @@ def run_phase3_common_processing(
               OR (max_solution_usefulness >= high_usefulness)
               => generate support playbook using top 4 threads + Azure AI Search docs
 
-    Uses ProWorkerPool for slow-start parallelism against GPT-5 Pro.
+    Uses GPT-5.2 via ThreadPoolExecutor.
     """
-    from aoai_helpers import ProWorkerPool
-
     try:
         results: List[Dict[str, Any]] = []
 
