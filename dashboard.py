@@ -65,6 +65,7 @@ from dashboard_db import (
     create_batch,
     list_batches,
     force_reset_batch,
+    force_reset_wiki_for_batch,
     list_batch_ids,
 )
 
@@ -1509,3 +1510,36 @@ elif page == "⚙️ Pipelines":
                         )
                     except Exception as e:
                         st.error(f"Reset failed: {e}")
+
+                st.divider()
+                st.markdown("**Step 2 (optional): also clear wiki/playbook content for this batch**")
+                st.caption(
+                    "Only clears Phase 3 playbooks and 4B/4C/4D wiki pages for clusters "
+                    "whose threads are *exclusively* from this batch. "
+                    "Clusters shared with other batches are left untouched."
+                )
+                fr_wiki_product = st.selectbox(
+                    "Product (required for wiki reset)",
+                    options=product_names if product_names else [],
+                    key="force_wiki_product",
+                )
+                do_force_wiki = st.button(
+                    "🗑️ Also Clear Wiki/Playbooks",
+                    key="force_wiki_btn",
+                    use_container_width=True,
+                    disabled=not ((force_batch_id or "").strip() and fr_wiki_product),
+                    help="Clears Phase 3 + 4B/4C/4D content for clusters exclusively from this batch.",
+                )
+                if do_force_wiki and (force_batch_id or "").strip() and fr_wiki_product:
+                    try:
+                        wr = force_reset_wiki_for_batch(cnx, force_batch_id.strip(), fr_wiki_product)
+                        st.success(
+                            f"✅ Wiki content cleared for **{wr['product']}** / **{wr['batch_id']}**:\n"
+                            f"- Phase 3 playbooks deleted: **{wr['deleted_playbooks']}**\n"
+                            f"- 4B variant wiki pages cleared: **{wr['reset_4b_variants']}**\n"
+                            f"- 4C scenario wiki pages cleared: **{wr['reset_4c_scenarios']}**\n"
+                            f"- 4D topic wiki pages cleared: **{wr['reset_4d_topics']}**\n\n"
+                            "Re-run the pipeline to regenerate with the correct models."
+                        )
+                    except Exception as e:
+                        st.error(f"Wiki reset failed: {e}")

@@ -608,6 +608,131 @@ def force_reset_batch(cnx: pyodbc.Connection, batch_id: str) -> Dict[str, int]:
     }
 
 
+
+
+def force_reset_wiki_for_batch(cnx, batch_id: str, product: str) -> dict:
+    """
+    Clear wiki/playbook content on catalog clusters touched EXCLUSIVELY by
+    this batch+product. If any thread from another batch maps to the same
+    cluster, that cluster is left untouched.
+
+    Clears:
+      Phase 3  - CommonIssueSolutions rows for L4 leaves
+      Phase 4B - WikiPath/WikiContent on L3 variants
+      Phase 4C - ScenarioWikiPath on L2 scenarios
+      Phase 4D - TopicWikiPath on L1 topics
+    """
+    if not batch_id or not batch_id.strip():
+        raise ValueError("batch_id is required")
+    if not product or not product.strip():
+        raise ValueError("product is required")
+    batch_id = batch_id.strip()
+    product  = product.strip()
+
+    cur = cnx.cursor()
+
+    # L4 leaves — Phase 3 playbooks
+    cur.execute("""
+        DELETE cis
+        FROM dbo.CommonIssueSolutions cis
+        WHERE cis.ClusterID IN (
+            SELECT te.ResolutionLeafClusterID
+            FROM dbo.thread_enrichment te
+            WHERE te.batch_id = ?
+              AND te.product  = ?
+              AND te.ResolutionLeafClusterID IS NOT NULL
+            GROUP BY te.ResolutionLeafClusterID
+            HAVING COUNT(*) = (
+                SELECT COUNT(*) FROM dbo.thread_enrichment te2
+                WHERE te2.ResolutionLeafClusterID = te.ResolutionLeafClusterID
+                  AND te2.product = ?
+            )
+        )
+    """, batch_id, product, product)
+    deleted_playbooks = int(cur.rowcount or 0)
+
+    # L3 variants — Phase 4B wiki
+    cur.execute("""
+        UPDATE ic
+        SET ic.WikiPath             = NULL,
+            ic.WikiPushedUtc        = NULL,
+            ic.WikiContentMarkdown  = NULL,
+            ic.WikiModel            = NULL,
+            ic.WikiContentHash      = NULL,
+            ic.VariantWikiPath      = NULL,
+            ic.VariantWikiPushedUtc = NULL
+        FROM dbo.issue_cluster ic
+        WHERE ic.cluster_level = 3 AND ic.product = ?
+          AND ic.cluster_id IN (
+              SELECT te.VariantClusterID
+              FROM dbo.thread_enrichment te
+              WHERE te.batch_id = ? AND te.product = ?
+                AND te.VariantClusterID IS NOT NULL
+              GROUP BY te.VariantClusterID
+              HAVING COUNT(*) = (
+                  SELECT COUNT(*) FROM dbo.thread_enrichment te2
+                  WHERE te2.VariantClusterID = te.VariantClusterID
+                    AND te2.product = ?
+              )
+          )
+    """, product, batch_id, product, product)
+    reset_4b = int(cur.rowcount or 0)
+
+    # L2 scenarios — Phase 4C wiki
+    cur.execute("""
+        UPDATE ic
+        SET ic.ScenarioWikiPath      = NULL,
+            ic.ScenarioWikiPushedUtc = NULL
+        FROM dbo.issue_cluster ic
+        WHERE ic.cluster_level = 2 AND ic.product = ?
+          AND ic.cluster_id IN (
+              SELECT te.ScenarioClusterID
+              FROM dbo.thread_enrichment te
+              WHERE te.batch_id = ? AND te.product = ?
+                AND te.ScenarioClusterID IS NOT NULL
+              GROUP BY te.ScenarioClusterID
+              HAVING COUNT(*) = (
+                  SELECT COUNT(*) FROM dbo.thread_enrichment te2
+                  WHERE te2.ScenarioClusterID = te.ScenarioClusterID
+                    AND te2.product = ?
+              )
+          )
+    """, product, batch_id, product, product)
+    reset_4c = int(cur.rowcount or 0)
+
+    # L1 topics — Phase 4D wiki
+    cur.execute("""
+        UPDATE ic
+        SET ic.TopicWikiPath      = NULL,
+            ic.TopicWikiPushedUtc = NULL
+        FROM dbo.issue_cluster ic
+        WHERE ic.cluster_level = 1 AND ic.product = ?
+          AND ic.cluster_id IN (
+              SELECT te.TopicClusterID
+              FROM dbo.thread_enrichment te
+              WHERE te.batch_id = ? AND te.product = ?
+                AND te.TopicClusterID IS NOT NULL
+              GROUP BY te.TopicClusterID
+              HAVING COUNT(*) = (
+                  SELECT COUNT(*) FROM dbo.thread_enrichment te2
+                  WHERE te2.TopicClusterID = te.TopicClusterID
+                    AND te2.product = ?
+              )
+          )
+    """, product, batch_id, product, product)
+    reset_4d = int(cur.rowcount or 0)
+
+    cnx.commit()
+
+    return {
+        "batch_id":           batch_id,
+        "product":            product,
+        "deleted_playbooks":  deleted_playbooks,
+        "reset_4b_variants":  reset_4b,
+        "reset_4c_scenarios": reset_4c,
+        "reset_4d_topics":    reset_4d,
+    }
+
 def list_batch_ids(cnx: pyodbc.Connection, limit: int = 50) -> List[str]:
     """Return distinct batch_ids that have threads, newest first."""
     cur = cnx.cursor()
