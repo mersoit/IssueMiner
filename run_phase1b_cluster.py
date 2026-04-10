@@ -1547,6 +1547,8 @@ def run_phase1b_cluster(req: func.HttpRequest) -> func.HttpResponse:
             seen_products: Set[str] = set()
             catalog_slice_start = 0
 
+            batch_aoai_errors = 0
+
             for _ in range(max_batches):
                 remaining = limit - processed_total
                 if remaining <= 0:
@@ -1593,373 +1595,382 @@ def run_phase1b_cluster(req: func.HttpRequest) -> func.HttpResponse:
                     [str(r.get("thread_id")) for r in rows][:10],
                 )
 
-                rows_by_product: Dict[str, List[Dict[str, Any]]] = {}
-                for r in rows:
-                    prod = str(r.get("product") or "").strip() or "Other"
-                    rows_by_product.setdefault(prod, []).append(r)
+                try:
+                    rows_by_product: Dict[str, List[Dict[str, Any]]] = {}
+                    for r in rows:
+                        prod = str(r.get("product") or "").strip() or "Other"
+                        rows_by_product.setdefault(prod, []).append(r)
 
-                inserted_batch: List[Dict[str, Any]] = []
+                    inserted_batch: List[Dict[str, Any]] = []
 
-                for batch_product, batch_rows in rows_by_product.items():
-                    default_prod = batch_product
-                    catalog_slice_start = 0
+                    for batch_product, batch_rows in rows_by_product.items():
+                        default_prod = batch_product
+                        catalog_slice_start = 0
 
-                    candidates: Dict[str, Dict[str, Any]] = {}
+                        candidates: Dict[str, Dict[str, Any]] = {}
 
-                    # Pre-filter catalog to this product only, so slice_limit
-                    # applies to product-relevant rows rather than the full mixed catalog.
-                    product_catalog = [
-                        r for r in catalog_rows
-                        if str(r.get("product") or "").strip() == default_prod
-                    ]
+                        # Pre-filter catalog to this product only, so slice_limit
+                        # applies to product-relevant rows rather than the full mixed catalog.
+                        product_catalog = [
+                            r for r in catalog_rows
+                            if str(r.get("product") or "").strip() == default_prod
+                        ]
 
-                    effective_slices = 1 if len(product_catalog) <= slice_limit else max_slices
-                    prev_candidate_keys: Optional[set] = None
+                        effective_slices = 1 if len(product_catalog) <= slice_limit else max_slices
+                        prev_candidate_keys: Optional[set] = None
 
-                    for slice_index in range(1, effective_slices + 1):
-                        # Window and slim directly over the product-scoped catalog
-                        window = _catalog_window(product_catalog, start=catalog_slice_start, size=slice_limit)
-                        slim_slice = _build_slim_catalog_slice(product_catalog, window)
+                        for slice_index in range(1, effective_slices + 1):
+                            # Window and slim directly over the product-scoped catalog
+                            window = _catalog_window(product_catalog, start=catalog_slice_start, size=slice_limit)
+                            slim_slice = _build_slim_catalog_slice(product_catalog, window)
 
-                        if slice_index > 1 and len(product_catalog) > slice_limit:
-                            catalog_slice_start = (catalog_slice_start + slice_limit) % max(1, len(product_catalog))
+                            if slice_index > 1 and len(product_catalog) > slice_limit:
+                                catalog_slice_start = (catalog_slice_start + slice_limit) % max(1, len(product_catalog))
 
-                        if slice_index == 1:
-                            out = call_nano_catalog_propose(
-                                client,
-                                deployment,
-                                threads=batch_rows,
-                                catalog_slice=slim_slice,
-                                slice_index=slice_index,
-                                slices_total=effective_slices,
-                            )
-                            nano_calls += 1
+                            if slice_index == 1:
+                                out = call_nano_catalog_propose(
+                                    client,
+                                    deployment,
+                                    threads=batch_rows,
+                                    catalog_slice=slim_slice,
+                                    slice_index=slice_index,
+                                    slices_total=effective_slices,
+                                )
+                                nano_calls += 1
 
-                            proposed = out.get("candidates") or []
+                                proposed = out.get("candidates") or []
 
-                            existing_l1 = _catalog_l1_keys_for_product(catalog_rows, default_prod)
-                            proposed_l1 = {
-                                _norm_key(n.get("topic_key") or "")
-                                for n in proposed
-                                if _norm_level(n.get("level")) == 1
-                                and (str(n.get("product") or "").strip() in ("", default_prod))
-                            }
+                                existing_l1 = _catalog_l1_keys_for_product(catalog_rows, default_prod)
+                                proposed_l1 = {
+                                    _norm_key(n.get("topic_key") or "")
+                                    for n in proposed
+                                    if _norm_level(n.get("level")) == 1
+                                    and (str(n.get("product") or "").strip() in ("", default_prod))
+                                }
 
-                            for n in proposed:
-                                prod = str(n.get("product") or "").strip() or default_prod
+                                for n in proposed:
+                                    prod = str(n.get("product") or "").strip() or default_prod
 
-                                if prod != default_prod:
-                                    skipped_total.append(
-                                        {
-                                            "product": prod,
-                                            "level": n.get("level"),
-                                            "why": f"cross_product_candidate_in_{default_prod}_batch",
-                                        }
-                                    )
-                                    continue
-
-                                lvl = _norm_level(n.get("level"))
-
-                                topic_key = _norm_key(n.get("topic_key") or "")
-                                scenario_key = _norm_key(n.get("scenario_key") or "")
-                                variant_key = _norm_key(n.get("variant_key") or "")
-                                leaf_key = _norm_key(n.get("leaf_key") or "")
-
-                                # --- Auto-repair: strip leading product alias from all keys ---
-                                topic_key_repaired = _strip_product_prefix(topic_key, prod)
-                                scenario_key_repaired = _strip_product_prefix(scenario_key, prod)
-                                variant_key_repaired = _strip_product_prefix(variant_key, prod)
-                                leaf_key_repaired = _strip_product_prefix(leaf_key, prod)
-
-                                # Log when repair changes something (helps tune Phase 1A prompt)
-                                if topic_key_repaired != topic_key:
-                                    logging.warning(
-                                        "phase1b key_repair product=%s level=%d "
-                                        "topic_key: '%s' -> '%s'",
-                                        prod, lvl, topic_key, topic_key_repaired,
-                                    )
-                                if scenario_key_repaired != scenario_key:
-                                    logging.warning(
-                                        "phase1b key_repair product=%s level=%d "
-                                        "scenario_key: '%s' -> '%s'",
-                                        prod, lvl, scenario_key, scenario_key_repaired,
-                                    )
-
-                                topic_key = topic_key_repaired
-                                scenario_key = scenario_key_repaired
-                                variant_key = variant_key_repaired
-                                leaf_key = leaf_key_repaired
-                                # --- End auto-repair ---
-
-                                # Reject if topic key is still a product alias after repair
-                                if _key_contains_product_alias(topic_key, prod):
-                                    skipped_total.append({
-                                        "product": prod,
-                                        "level": lvl,
-                                        "why": "topic_key_is_product_alias",
-                                        "topic_key": topic_key,
-                                    })
-                                    logging.warning(
-                                        "phase1b rejected product_alias_topic product=%s "
-                                        "topic_key='%s'",
-                                        prod, topic_key,
-                                    )
-                                    continue
-
-                                sig = (n.get("signature_text") or "").strip()
-                                res_sig = (n.get("resolution_signature_text") or "").strip() if n.get("resolution_signature_text") else None
-
-                                if not prod or lvl not in (1, 2, 3, 4):
-                                    skipped_total.append({"product": prod, "level": lvl, "why": "bad_product_or_level"})
-                                    continue
-
-                                if lvl == 4 and not res_sig:
-                                    res_sig = sig
-
-                                if (lvl == 1 and not topic_key) or \
-                                   (lvl == 2 and (not topic_key or not scenario_key)) or \
-                                   (lvl == 3 and (not topic_key or not scenario_key or not variant_key)) or \
-                                   (lvl == 4 and (not topic_key or not scenario_key or not variant_key or not leaf_key)):
-                                    skipped_total.append({"product": prod, "level": lvl, "why": "missing_required_keys"})
-                                    continue
-
-                                if lvl in (2, 3, 4):
-                                    if topic_key not in existing_l1 and topic_key not in proposed_l1:
+                                    if prod != default_prod:
                                         skipped_total.append(
                                             {
                                                 "product": prod,
-                                                "level": lvl,
-                                                "why": "topic_key_not_in_existing_or_proposed_l1",
-                                                "topic_key": topic_key,
+                                                "level": n.get("level"),
+                                                "why": f"cross_product_candidate_in_{default_prod}_batch",
                                             }
                                         )
                                         continue
 
-                                cid = _candidate_id(prod, lvl, topic_key, scenario_key, variant_key, leaf_key)
-                                candidates[cid] = {
-                                    "candidate_id": cid,
-                                    "product": prod,
-                                    "level": lvl,
-                                    "topic_key": topic_key,
-                                    "scenario_key": scenario_key,
-                                    "variant_key": variant_key,
-                                    "leaf_key": leaf_key,
-                                    "signature_text": sig,
-                                    "resolution_signature_text": res_sig,
-                                }
+                                    lvl = _norm_level(n.get("level"))
 
-                            if not candidates:
-                                break
+                                    topic_key = _norm_key(n.get("topic_key") or "")
+                                    scenario_key = _norm_key(n.get("scenario_key") or "")
+                                    variant_key = _norm_key(n.get("variant_key") or "")
+                                    leaf_key = _norm_key(n.get("leaf_key") or "")
 
-                            prev_candidate_keys = set(candidates.keys())
+                                    # --- Auto-repair: strip leading product alias from all keys ---
+                                    topic_key_repaired = _strip_product_prefix(topic_key, prod)
+                                    scenario_key_repaired = _strip_product_prefix(scenario_key, prod)
+                                    variant_key_repaired = _strip_product_prefix(variant_key, prod)
+                                    leaf_key_repaired = _strip_product_prefix(leaf_key, prod)
 
-                        else:
-                            # Skip refine slice if there are no catalog rows for this product
-                            # in the current window — it would be a no-op Nano call.
-                            if not slim_slice:
-                                logging.warning(
-                                    "phase1b skipping empty refine slice=%d/%d product=%s",
-                                    slice_index, effective_slices, default_prod,
-                                )
-                                continue
+                                    # Log when repair changes something (helps tune Phase 1A prompt)
+                                    if topic_key_repaired != topic_key:
+                                        logging.warning(
+                                            "phase1b key_repair product=%s level=%d "
+                                            "topic_key: '%s' -> '%s'",
+                                            prod, lvl, topic_key, topic_key_repaired,
+                                        )
+                                    if scenario_key_repaired != scenario_key:
+                                        logging.warning(
+                                            "phase1b key_repair product=%s level=%d "
+                                            "scenario_key: '%s' -> '%s'",
+                                            prod, lvl, scenario_key, scenario_key_repaired,
+                                        )
 
-                            prior_candidates = list(candidates.values())
-                            out = call_nano_catalog_refine(
-                                client,
-                                deployment,
-                                threads=batch_rows,
-                                catalog_slice=slim_slice,
-                                prior_candidates=prior_candidates,
-                                slice_index=slice_index,
-                                slices_total=effective_slices,
-                            )
-                            nano_calls += 1
+                                    topic_key = topic_key_repaired
+                                    scenario_key = scenario_key_repaired
+                                    variant_key = variant_key_repaired
+                                    leaf_key = leaf_key_repaired
+                                    # --- End auto-repair ---
 
-                            keep_ids = set(str(x) for x in (out.get("keep_candidate_ids") or []) if x)
-                            drops = out.get("drop") or []
-                            adds = out.get("add") or []
-
-                            for d in drops:
-                                did = str(d.get("candidate_id") or "")
-                                if did and did in candidates:
-                                    dropped_total.append({"candidate_id": did, "reason": d.get("reason")})
-                                    candidates.pop(did, None)
-
-                            if _should_apply_keep_list(keep_ids, prior_count=len(prior_candidates)):
-                                for did in list(candidates.keys()):
-                                    if did not in keep_ids:
-                                        dropped_total.append({"candidate_id": did, "reason": "not_in_keep_list"})
-                                        candidates.pop(did, None)
-
-                            existing_l1 = _catalog_l1_keys_for_product(catalog_rows, default_prod)
-                            adds_l1 = {
-                                _norm_key(n.get("topic_key") or "")
-                                for n in adds
-                                if _norm_level(n.get("level")) == 1
-                                and (str(n.get("product") or "").strip() in ("", default_prod))
-                            }
-
-                            for n in adds:
-                                prod = str(n.get("product") or "").strip() or default_prod
-                                if prod != default_prod:
-                                    continue
-
-                                lvl = _norm_level(n.get("level"))
-
-                                topic_key = _norm_key(n.get("topic_key") or "")
-                                scenario_key = _norm_key(n.get("scenario_key") or "")
-                                variant_key = _norm_key(n.get("variant_key") or "")
-                                leaf_key = _norm_key(n.get("leaf_key") or "")
-
-                                # --- Auto-repair: strip leading product alias from all keys ---
-                                topic_key_repaired = _strip_product_prefix(topic_key, prod)
-                                scenario_key_repaired = _strip_product_prefix(scenario_key, prod)
-                                variant_key_repaired = _strip_product_prefix(variant_key, prod)
-                                leaf_key_repaired = _strip_product_prefix(leaf_key, prod)
-
-                                if topic_key_repaired != topic_key:
-                                    logging.warning(
-                                        "phase1b key_repair(adds) product=%s level=%d "
-                                        "topic_key: '%s' -> '%s'",
-                                        prod, lvl, topic_key, topic_key_repaired,
-                                    )
-                                if scenario_key_repaired != scenario_key:
-                                    logging.warning(
-                                        "phase1b key_repair(adds) product=%s level=%d "
-                                        "scenario_key: '%s' -> '%s'",
-                                        prod, lvl, scenario_key, scenario_key_repaired,
-                                    )
-
-                                topic_key = topic_key_repaired
-                                scenario_key = scenario_key_repaired
-                                variant_key = variant_key_repaired
-                                leaf_key = leaf_key_repaired
-                                # --- End auto-repair ---
-
-                                # Reject if topic key is still a product alias after repair
-                                if _key_contains_product_alias(topic_key, prod):
-                                    skipped_total.append({
-                                        "product": prod,
-                                        "level": lvl,
-                                        "why": "topic_key_is_product_alias",
-                                        "topic_key": topic_key,
-                                    })
-                                    logging.warning(
-                                        "phase1b rejected product_alias_topic(adds) product=%s "
-                                        "topic_key='%s'",
-                                        prod, topic_key,
-                                    )
-                                    continue
-
-                                sig = (n.get("signature_text") or "").strip()
-                                res_sig = (n.get("resolution_signature_text") or "").strip() if n.get("resolution_signature_text") else None
-
-                                if not prod or lvl not in (1, 2, 3, 4):
-                                    continue
-
-                                if lvl == 4 and not res_sig:
-                                    res_sig = sig
-
-                                if (lvl == 1 and not topic_key) or \
-                                   (lvl == 2 and (not topic_key or not scenario_key)) or \
-                                   (lvl == 3 and (not topic_key or not scenario_key or not variant_key)) or \
-                                   (lvl == 4 and (not topic_key or not scenario_key or not variant_key or not leaf_key)):
-                                    continue
-
-                                if lvl in (2, 3, 4):
-                                    if topic_key not in existing_l1 and topic_key not in adds_l1:
+                                    # Reject if topic key is still a product alias after repair
+                                    if _key_contains_product_alias(topic_key, prod):
+                                        skipped_total.append({
+                                            "product": prod,
+                                            "level": lvl,
+                                            "why": "topic_key_is_product_alias",
+                                            "topic_key": topic_key,
+                                        })
+                                        logging.warning(
+                                            "phase1b rejected product_alias_topic product=%s "
+                                            "topic_key='%s'",
+                                            prod, topic_key,
+                                        )
                                         continue
 
-                                cid = _candidate_id(prod, lvl, topic_key, scenario_key, variant_key, leaf_key)
-                                candidates[cid] = {
-                                    "candidate_id": cid,
-                                    "product": prod,
-                                    "level": lvl,
-                                    "topic_key": topic_key,
-                                    "scenario_key": scenario_key,
-                                    "variant_key": variant_key,
-                                    "leaf_key": leaf_key,
-                                    "signature_text": sig,
-                                    "resolution_signature_text": res_sig,
-                                }
+                                    sig = (n.get("signature_text") or "").strip()
+                                    res_sig = (n.get("resolution_signature_text") or "").strip() if n.get("resolution_signature_text") else None
 
-                            cur_keys = set(candidates.keys())
-                            if prev_candidate_keys is not None and cur_keys == prev_candidate_keys:
-                                break
-                            prev_candidate_keys = cur_keys
+                                    if not prod or lvl not in (1, 2, 3, 4):
+                                        skipped_total.append({"product": prod, "level": lvl, "why": "bad_product_or_level"})
+                                        continue
 
-                    # Synthesize L4 leaf candidates from enrichment hints
-                    # (ensures leaves get created even if model didn't propose them)
-                    synth_count = _synthesize_leaf_candidates_from_hints(
-                        batch_rows, default_prod, candidates, catalog_rows,
-                    )
-                    if synth_count > 0:
-                        logging.warning(
-                            "phase1b synthesized_leaf_candidates product=%s count=%d",
-                            default_prod, synth_count,
-                        )
-                    synthesized_total += synth_count
+                                    if lvl == 4 and not res_sig:
+                                        res_sig = sig
 
-                    _ensure_parent_scaffolding(candidates)
-                    bulk_nodes = _build_bulk_nodes_from_candidates(candidates)
-                    logging.warning(
-                        "phase1b bulk_nodes product=%s count=%d levels=%s sample=%s",
-                        default_prod,
-                        len(bulk_nodes),
-                        sorted({int(n.get("level") or 0) for n in bulk_nodes}),
-                        bulk_nodes[:5],
-                    )
+                                    if (lvl == 1 and not topic_key) or \
+                                       (lvl == 2 and (not topic_key or not scenario_key)) or \
+                                       (lvl == 3 and (not topic_key or not scenario_key or not variant_key)) or \
+                                       (lvl == 4 and (not topic_key or not scenario_key or not variant_key or not leaf_key)):
+                                        skipped_total.append({"product": prod, "level": lvl, "why": "missing_required_keys"})
+                                        continue
 
-                    nodes_by_level: Dict[int, List[Dict[str, Any]]] = {1: [], 2: [], 3: [], 4: []}
-                    for n in bulk_nodes:
-                        lvl = int(n.get("level") or 0)
-                        if lvl in nodes_by_level:
-                            nodes_by_level[lvl].append(n)
+                                    if lvl in (2, 3, 4):
+                                        if topic_key not in existing_l1 and topic_key not in proposed_l1:
+                                            skipped_total.append(
+                                                {
+                                                    "product": prod,
+                                                    "level": lvl,
+                                                    "why": "topic_key_not_in_existing_or_proposed_l1",
+                                                    "topic_key": topic_key,
+                                                }
+                                            )
+                                            continue
 
-                    for lvl in (1, 2, 3, 4):
-                        lvl_nodes = nodes_by_level[lvl]
-                        if not lvl_nodes:
-                            continue
-
-                        for i0 in range(0, len(lvl_nodes), _P1B_INSERT_BATCH):
-                            chunk = lvl_nodes[i0 : i0 + _P1B_INSERT_BATCH]
-                            out_rows = bulk_get_or_create_issue_clusters(cnx, chunk)
-
-                            for r in out_rows:
-                                prod = str(r.get("product") or "").strip()
-                                out_lvl = int(r.get("level") or 0)
-                                key = str(r.get("key") or "").strip()
-                                parent_key = r.get("parent_key")
-                                parent_key_s = str(parent_key).strip() if parent_key is not None else None
-                                cid = r.get("cluster_id")
-
-                                if not prod or out_lvl not in (1, 2, 3, 4) or not key or cid is None:
-                                    continue
-
-                                sig = str(r.get("signature_text") or "").strip()
-                                res_sig = r.get("resolution_signature_text")
-                                if isinstance(res_sig, str):
-                                    res_sig = res_sig.strip() or None
-
-                                inserted_batch.append(
-                                    {
+                                    cid = _candidate_id(prod, lvl, topic_key, scenario_key, variant_key, leaf_key)
+                                    candidates[cid] = {
+                                        "candidate_id": cid,
                                         "product": prod,
-                                        "level": out_lvl,
-                                        "key": key,
-                                        "parent_key": parent_key_s,
-                                        "cluster_id": int(cid),
+                                        "level": lvl,
+                                        "topic_key": topic_key,
+                                        "scenario_key": scenario_key,
+                                        "variant_key": variant_key,
+                                        "leaf_key": leaf_key,
                                         "signature_text": sig,
                                         "resolution_signature_text": res_sig,
                                     }
+
+                                if not candidates:
+                                    break
+
+                                prev_candidate_keys = set(candidates.keys())
+
+                            else:
+                                # Skip refine slice if there are no catalog rows for this product
+                                # in the current window — it would be a no-op Nano call.
+                                if not slim_slice:
+                                    logging.warning(
+                                        "phase1b skipping empty refine slice=%d/%d product=%s",
+                                        slice_index, effective_slices, default_prod,
+                                    )
+                                    continue
+
+                                prior_candidates = list(candidates.values())
+                                out = call_nano_catalog_refine(
+                                    client,
+                                    deployment,
+                                    threads=batch_rows,
+                                    catalog_slice=slim_slice,
+                                    prior_candidates=prior_candidates,
+                                    slice_index=slice_index,
+                                    slices_total=effective_slices,
                                 )
+                                nano_calls += 1
 
-                mark_catalog_checked(cnx, [str(r.get("thread_id")) for r in rows if r.get("thread_id")])
-                cnx.commit()
+                                keep_ids = set(str(x) for x in (out.get("keep_candidate_ids") or []) if x)
+                                drops = out.get("drop") or []
+                                adds = out.get("add") or []
 
-                _append_inserted_to_catalog_rows(catalog_rows, inserted_batch, by_level_key_parent)
+                                for d in drops:
+                                    did = str(d.get("candidate_id") or "")
+                                    if did and did in candidates:
+                                        dropped_total.append({"candidate_id": did, "reason": d.get("reason")})
+                                        candidates.pop(did, None)
 
-                processed_total += len(rows)
-                inserted_total.extend(inserted_batch)
+                                if _should_apply_keep_list(keep_ids, prior_count=len(prior_candidates)):
+                                    for did in list(candidates.keys()):
+                                        if did not in keep_ids:
+                                            dropped_total.append({"candidate_id": did, "reason": "not_in_keep_list"})
+                                            candidates.pop(did, None)
+
+                                existing_l1 = _catalog_l1_keys_for_product(catalog_rows, default_prod)
+                                adds_l1 = {
+                                    _norm_key(n.get("topic_key") or "")
+                                    for n in adds
+                                    if _norm_level(n.get("level")) == 1
+                                    and (str(n.get("product") or "").strip() in ("", default_prod))
+                                }
+
+                                for n in adds:
+                                    prod = str(n.get("product") or "").strip() or default_prod
+                                    if prod != default_prod:
+                                        continue
+
+                                    lvl = _norm_level(n.get("level"))
+
+                                    topic_key = _norm_key(n.get("topic_key") or "")
+                                    scenario_key = _norm_key(n.get("scenario_key") or "")
+                                    variant_key = _norm_key(n.get("variant_key") or "")
+                                    leaf_key = _norm_key(n.get("leaf_key") or "")
+
+                                    # --- Auto-repair: strip leading product alias from all keys ---
+                                    topic_key_repaired = _strip_product_prefix(topic_key, prod)
+                                    scenario_key_repaired = _strip_product_prefix(scenario_key, prod)
+                                    variant_key_repaired = _strip_product_prefix(variant_key, prod)
+                                    leaf_key_repaired = _strip_product_prefix(leaf_key, prod)
+
+                                    if topic_key_repaired != topic_key:
+                                        logging.warning(
+                                            "phase1b key_repair(adds) product=%s level=%d "
+                                            "topic_key: '%s' -> '%s'",
+                                            prod, lvl, topic_key, topic_key_repaired,
+                                        )
+                                    if scenario_key_repaired != scenario_key:
+                                        logging.warning(
+                                            "phase1b key_repair(adds) product=%s level=%d "
+                                            "scenario_key: '%s' -> '%s'",
+                                            prod, lvl, scenario_key, scenario_key_repaired,
+                                        )
+
+                                    topic_key = topic_key_repaired
+                                    scenario_key = scenario_key_repaired
+                                    variant_key = variant_key_repaired
+                                    leaf_key = leaf_key_repaired
+                                    # --- End auto-repair ---
+
+                                    # Reject if topic key is still a product alias after repair
+                                    if _key_contains_product_alias(topic_key, prod):
+                                        skipped_total.append({
+                                            "product": prod,
+                                            "level": lvl,
+                                            "why": "topic_key_is_product_alias",
+                                            "topic_key": topic_key,
+                                        })
+                                        logging.warning(
+                                            "phase1b rejected product_alias_topic(adds) product=%s "
+                                            "topic_key='%s'",
+                                            prod, topic_key,
+                                        )
+                                        continue
+
+                                    sig = (n.get("signature_text") or "").strip()
+                                    res_sig = (n.get("resolution_signature_text") or "").strip() if n.get("resolution_signature_text") else None
+
+                                    if not prod or lvl not in (1, 2, 3, 4):
+                                        continue
+
+                                    if lvl == 4 and not res_sig:
+                                        res_sig = sig
+
+                                    if (lvl == 1 and not topic_key) or \
+                                       (lvl == 2 and (not topic_key or not scenario_key)) or \
+                                       (lvl == 3 and (not topic_key or not scenario_key or not variant_key)) or \
+                                       (lvl == 4 and (not topic_key or not scenario_key or not variant_key or not leaf_key)):
+                                        continue
+
+                                    if lvl in (2, 3, 4):
+                                        if topic_key not in existing_l1 and topic_key not in adds_l1:
+                                            continue
+
+                                    cid = _candidate_id(prod, lvl, topic_key, scenario_key, variant_key, leaf_key)
+                                    candidates[cid] = {
+                                        "candidate_id": cid,
+                                        "product": prod,
+                                        "level": lvl,
+                                        "topic_key": topic_key,
+                                        "scenario_key": scenario_key,
+                                        "variant_key": variant_key,
+                                        "leaf_key": leaf_key,
+                                        "signature_text": sig,
+                                        "resolution_signature_text": res_sig,
+                                    }
+
+                                cur_keys = set(candidates.keys())
+                                if prev_candidate_keys is not None and cur_keys == prev_candidate_keys:
+                                    break
+                                prev_candidate_keys = cur_keys
+
+                        # Synthesize L4 leaf candidates from enrichment hints
+                        # (ensures leaves get created even if model didn't propose them)
+                        synth_count = _synthesize_leaf_candidates_from_hints(
+                            batch_rows, default_prod, candidates, catalog_rows,
+                        )
+                        if synth_count > 0:
+                            logging.warning(
+                                "phase1b synthesized_leaf_candidates product=%s count=%d",
+                                default_prod, synth_count,
+                            )
+                        synthesized_total += synth_count
+
+                        _ensure_parent_scaffolding(candidates)
+                        bulk_nodes = _build_bulk_nodes_from_candidates(candidates)
+                        logging.warning(
+                            "phase1b bulk_nodes product=%s count=%d levels=%s sample=%s",
+                            default_prod,
+                            len(bulk_nodes),
+                            sorted({int(n.get("level") or 0) for n in bulk_nodes}),
+                            bulk_nodes[:5],
+                        )
+
+                        nodes_by_level: Dict[int, List[Dict[str, Any]]] = {1: [], 2: [], 3: [], 4: []}
+                        for n in bulk_nodes:
+                            lvl = int(n.get("level") or 0)
+                            if lvl in nodes_by_level:
+                                nodes_by_level[lvl].append(n)
+
+                        for lvl in (1, 2, 3, 4):
+                            lvl_nodes = nodes_by_level[lvl]
+                            if not lvl_nodes:
+                                continue
+
+                            for i0 in range(0, len(lvl_nodes), _P1B_INSERT_BATCH):
+                                chunk = lvl_nodes[i0 : i0 + _P1B_INSERT_BATCH]
+                                out_rows = bulk_get_or_create_issue_clusters(cnx, chunk)
+
+                                for r in out_rows:
+                                    prod = str(r.get("product") or "").strip()
+                                    out_lvl = int(r.get("level") or 0)
+                                    key = str(r.get("key") or "").strip()
+                                    parent_key = r.get("parent_key")
+                                    parent_key_s = str(parent_key).strip() if parent_key is not None else None
+                                    cid = r.get("cluster_id")
+
+                                    if not prod or out_lvl not in (1, 2, 3, 4) or not key or cid is None:
+                                        continue
+
+                                    sig = str(r.get("signature_text") or "").strip()
+                                    res_sig = r.get("resolution_signature_text")
+                                    if isinstance(res_sig, str):
+                                        res_sig = res_sig.strip() or None
+
+                                    inserted_batch.append(
+                                        {
+                                            "product": prod,
+                                            "level": out_lvl,
+                                            "key": key,
+                                            "parent_key": parent_key_s,
+                                            "cluster_id": int(cid),
+                                            "signature_text": sig,
+                                            "resolution_signature_text": res_sig,
+                                        }
+                                    )
+
+                    mark_catalog_checked(cnx, [str(r.get("thread_id")) for r in rows if r.get("thread_id")])
+                    cnx.commit()
+
+                    _append_inserted_to_catalog_rows(catalog_rows, inserted_batch, by_level_key_parent)
+
+                    processed_total += len(rows)
+                    inserted_total.extend(inserted_batch)
+
+                except Exception as batch_exc:
+                    batch_aoai_errors += 1
+                    logging.warning(
+                        "phase1b AOAI error on batch (processed_so_far=%d, errors=%d): %s",
+                        processed_total, batch_aoai_errors, str(batch_exc)[:300],
+                    )
+                    break
 
         return func.HttpResponse(
             json.dumps(
