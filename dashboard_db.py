@@ -556,19 +556,18 @@ def merge_enrichment_products(
 
 def force_reset_batch(cnx: pyodbc.Connection, batch_id: str) -> Dict[str, int]:
     """
-    Reset all per-thread processing timestamps for a specific batch_id so the
-    pipeline phases will reprocess only those threads.
+    Reset downstream phase timestamps for a specific batch_id so the pipeline
+    will reprocess those threads through 1B → 2E → 4A.
 
     Scopes STRICTLY to batch_id — no other threads are touched.
+    Does NOT delete thread_enrichment rows — 1A enrichment data is preserved.
 
     Resets:
-      - 1A: EnrichedUtc (re-enrich)
-      - 1B: CatalogCheckedUtc (re-catalog)
-      - 2E: AssignmentStartedUtc, AssignmentCompletedUtc (re-assign leaf)
-      - 4A: NuggetsMinedUtc (re-mine nuggets) + deletes existing nugget rows
+      - 1B: CatalogCheckedUtc
+      - 2E: AssignmentStartedUtc, AssignmentCompletedUtc + 4 cluster ID columns
+      - 4A: NuggetsMinedUtc + deletes KnowledgeNuggets rows
 
-    Does NOT touch Phase 3 / 4B / 4C / 4D — those are cluster-level, not
-    batch-scoped, and resetting them could corrupt data for other products.
+    Does NOT touch Phase 3 / 4B / 4C / 4D — cluster-level, not batch-scoped.
     """
     if not batch_id or not batch_id.strip():
         raise ValueError("batch_id is required for force reset")
@@ -576,7 +575,7 @@ def force_reset_batch(cnx: pyodbc.Connection, batch_id: str) -> Dict[str, int]:
 
     cur = cnx.cursor()
 
-    # Delete nuggets first (subquery references thread_enrichment which we delete next)
+    # Delete nuggets first (before clearing NuggetsMinedUtc)
     cur.execute("""
         DELETE FROM dbo.KnowledgeNuggets
         WHERE ThreadID IN (
@@ -585,25 +584,28 @@ def force_reset_batch(cnx: pyodbc.Connection, batch_id: str) -> Dict[str, int]:
     """, batch_id)
     deleted_nuggets = int(cur.rowcount or 0)
 
-    # 1A — re-enrich: delete the enrichment row entirely so 1A's MERGE re-inserts it fresh.
-    # This also implicitly resets 1B, 2E and 4A since all their timestamps live on the same row.
+    # Clear 1B, 2E, 4A timestamps in a single UPDATE — 1A data stays intact
     cur.execute("""
-        DELETE FROM dbo.thread_enrichment
+        UPDATE dbo.thread_enrichment
+        SET CatalogCheckedUtc       = NULL,
+            AssignmentStartedUtc    = NULL,
+            AssignmentCompletedUtc  = NULL,
+            TopicClusterID          = NULL,
+            ScenarioClusterID       = NULL,
+            VariantClusterID        = NULL,
+            ResolutionLeafClusterID = NULL,
+            NuggetsMinedUtc         = NULL
         WHERE batch_id = ?
     """, batch_id)
-    reset_1a = int(cur.rowcount or 0)
-    reset_1b      = reset_1a  # same row
-    reset_2e      = reset_1a
-    reset_4a_flag = reset_1a
+    reset_rows = int(cur.rowcount or 0)
 
     cnx.commit()
 
     return {
         "batch_id":        batch_id,
-        "reset_1a":        reset_1a,
-        "reset_1b":        reset_1b,
-        "reset_2e":        reset_2e,
-        "reset_4a_flag":   reset_4a_flag,
+        "reset_1b":        reset_rows,
+        "reset_2e":        reset_rows,
+        "reset_4a_flag":   reset_rows,
         "deleted_nuggets": deleted_nuggets,
     }
 

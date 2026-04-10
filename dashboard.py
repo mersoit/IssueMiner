@@ -1462,8 +1462,9 @@ elif page == "⚙️ Pipelines":
                 st.caption(
                     "Resets processing timestamps for a specific batch so the pipeline will "
                     "reprocess only those threads. "
-                    "Affects: 1A (re-enrich), 1B (re-catalog), 2E (re-assign leaf), "
+                    "Affects: 1B (re-catalog), 2E (re-assign leaf), "
                     "4A (re-mine nuggets + deletes existing nuggets). "
+                    "**1A enrichment data is preserved.** "
                     "**Does NOT touch Phase 3 / 4B / 4C / 4D** — cluster-level wiki content "
                     "is not batch-scoped and resetting it would affect other products."
                 )
@@ -1502,11 +1503,11 @@ elif page == "⚙️ Pipelines":
                         result = force_reset_batch(cnx, force_batch_id.strip())
                         st.success(
                             f"✅ Batch **{result['batch_id']}** reset:\n"
-                            f"- 1A (re-enrich): **{result['reset_1a']}** threads\n"
                             f"- 1B (re-catalog): **{result['reset_1b']}** threads\n"
                             f"- 2E (re-assign): **{result['reset_2e']}** threads\n"
                             f"- 4A flag reset: **{result['reset_4a_flag']}** threads, "
                             f"deleted **{result['deleted_nuggets']}** nugget rows\n\n"
+                            f"1A enrichment data preserved. "
                             f"Now run the pipeline with Batch ID = `{result['batch_id']}` to reprocess."
                         )
                     except Exception as e:
