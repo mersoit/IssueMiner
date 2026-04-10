@@ -576,43 +576,7 @@ def force_reset_batch(cnx: pyodbc.Connection, batch_id: str) -> Dict[str, int]:
 
     cur = cnx.cursor()
 
-    # 1A — re-enrich
-    cur.execute("""
-        UPDATE dbo.thread_enrichment
-        SET EnrichedUtc = NULL
-        WHERE batch_id = ?
-    """, batch_id)
-    reset_1a = int(cur.rowcount or 0)
-
-    # 1B — re-catalog
-    cur.execute("""
-        UPDATE dbo.thread_enrichment
-        SET CatalogCheckedUtc = NULL
-        WHERE batch_id = ?
-    """, batch_id)
-    reset_1b = int(cur.rowcount or 0)
-
-    # 2E — re-assign leaf
-    cur.execute("""
-        UPDATE dbo.thread_enrichment
-        SET AssignmentStartedUtc  = NULL,
-            AssignmentCompletedUtc = NULL,
-            TopicClusterID         = NULL,
-            ScenarioClusterID      = NULL,
-            VariantClusterID       = NULL,
-            ResolutionLeafClusterID = NULL
-        WHERE batch_id = ?
-    """, batch_id)
-    reset_2e = int(cur.rowcount or 0)
-
-    # 4A — re-mine nuggets: clear flag + delete existing nugget rows
-    cur.execute("""
-        UPDATE dbo.thread_enrichment
-        SET NuggetsMinedUtc = NULL
-        WHERE batch_id = ?
-    """, batch_id)
-    reset_4a_flag = int(cur.rowcount or 0)
-
+    # Delete nuggets first (subquery references thread_enrichment which we delete next)
     cur.execute("""
         DELETE FROM dbo.KnowledgeNuggets
         WHERE ThreadID IN (
@@ -620,6 +584,17 @@ def force_reset_batch(cnx: pyodbc.Connection, batch_id: str) -> Dict[str, int]:
         )
     """, batch_id)
     deleted_nuggets = int(cur.rowcount or 0)
+
+    # 1A — re-enrich: delete the enrichment row entirely so 1A's MERGE re-inserts it fresh.
+    # This also implicitly resets 1B, 2E and 4A since all their timestamps live on the same row.
+    cur.execute("""
+        DELETE FROM dbo.thread_enrichment
+        WHERE batch_id = ?
+    """, batch_id)
+    reset_1a = int(cur.rowcount or 0)
+    reset_1b      = reset_1a  # same row
+    reset_2e      = reset_1a
+    reset_4a_flag = reset_1a
 
     cnx.commit()
 
