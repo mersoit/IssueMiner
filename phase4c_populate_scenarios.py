@@ -810,7 +810,14 @@ def _process_single_scenario(
         page = upsert_wiki_page(wiki_id, wiki_path, md)
 
         if not page:
+            with _sql_connect() as cnx:
+                _mark_scenario_wiki_populated(
+                    cnx, scenario_id, "push_failed",
+                    markdown="", model_name=model_tier,
+                )
+                cnx.commit()
             result["status"] = "wiki_push_failed"
+            result["wiki_path"] = wiki_path
             logging.error("[4C] scenario_id=%d – wiki push failed for path %s", scenario_id, wiki_path)
             return result
 
@@ -974,27 +981,33 @@ def run_phase4c_populate_scenarios(req: func.HttpRequest) -> func.HttpResponse:
                 model_tier=model_tier,
             )
 
-        # ProWorkerPool works for both tiers — GPT-5.2 is faster so the
-        # ramp is less critical, but it's harmless to keep it.
-        pool = ProWorkerPool(
-            max_workers=max_workers,
-            initial_workers=initial_workers,
-            ramp_interval=float(ramp_interval),
-            ramp_step=ramp_step,
-            caller_tag="4C",
-        )
-        logs = pool.run(candidates, _process)
+        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+        pool_workers = min(len(candidates), max_workers)
+        logging.info("[4C] Starting pool: %d items, workers=%d", len(candidates), pool_workers)
+        with ThreadPoolExecutor(max_workers=pool_workers) as executor:
+            futures_map = {executor.submit(_process, c): c for c in candidates}
+            logs = []
+            for fut in _as_completed(futures_map):
+                try:
+                    logs.append(fut.result())
+                except Exception as e:
+                    c = futures_map[fut]
+                    logs.append({"scenario_id": c.get("cluster_id"), "status": "worker_error", "error": str(e)})
+        logging.info("[4C] Pool complete: %d results", len(logs))
 
         summary: Dict[str, int] = {}
         for lg in logs:
             s = (lg.get("status") if isinstance(lg, dict) else "unknown") or "unknown"
             summary[s] = summary.get(s, 0) + 1
 
+        ok_count = summary.get("ok", 0)
+
         return func.HttpResponse(
             json.dumps(
                 {
                     "status": "ok",
-                    "processed": len(logs),
+                    "processed": ok_count,
+                    "attempted": len(logs),
                     "model_tier": model_tier,
                     "summary": summary,
                     "details": logs,

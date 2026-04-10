@@ -695,7 +695,14 @@ def _process_single_variant(
         page = upsert_wiki_page(wiki_id, wiki_path, md)
 
         if not page:
+            with _sql_connect() as cnx:
+                _mark_variant_wiki_populated(
+                    cnx, variant_id, "push_failed",
+                    markdown="", model_name=deployment,
+                )
+                cnx.commit()
             result["status"] = "wiki_push_failed"
+            result["wiki_path"] = wiki_path
             return result
 
         # --- Mark as done ---
@@ -845,10 +852,13 @@ def run_phase4b_populate_variants(req: func.HttpRequest) -> func.HttpResponse:
             s = lg.get("status", "unknown")
             summary[s] = summary.get(s, 0) + 1
 
+        ok_count = summary.get("ok", 0)
+
         return func.HttpResponse(
             json.dumps({
                 "status": "ok",
-                "processed": len(logs),
+                "processed": ok_count,
+                "attempted": len(logs),
                 "summary": summary,
                 "details": logs,
             }, ensure_ascii=False, default=str),

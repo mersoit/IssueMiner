@@ -790,7 +790,16 @@ def _process_single_topic(
         page = upsert_wiki_page(wiki_id, wiki_path, md)
 
         if not page:
+            # Write a sentinel so this candidate is not re-selected on the next call.
+            # Without this the loop retries the same topics forever.
+            with _sql_connect() as cnx:
+                _mark_topic_wiki_populated(
+                    cnx, topic_id, "push_failed",
+                    markdown="", model_name=deployment,
+                )
+                cnx.commit()
             result["status"] = "wiki_push_failed"
+            result["wiki_path"] = wiki_path
             return result
 
         # --- Mark as done in DB ---
@@ -913,11 +922,14 @@ def run_phase4d_populate_topics(req: func.HttpRequest) -> func.HttpResponse:
             s = lg.get("status", "unknown")
             summary[s] = summary.get(s, 0) + 1
 
+        ok_count = summary.get("ok", 0)
+
         return func.HttpResponse(
             json.dumps(
                 {
                     "status": "ok",
-                    "processed": len(logs),
+                    "processed": ok_count,
+                    "attempted": len(logs),
                     "summary": summary,
                     "details": logs,
                 },
