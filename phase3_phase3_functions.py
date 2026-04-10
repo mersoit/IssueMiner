@@ -948,12 +948,12 @@ def run_phase3_common_processing(
             )
 
         logging.info(
-            "[Phase3] Common leaf processing: %d candidates gathered, starting Mini pool",
+            "[Phase3] Common leaf processing: %d candidates gathered, starting GPT-5.2 pool",
             len(work_items),
         )
 
         # ----------------------------------------------------------
-        # 2) Parallel GPT-5 Mini calls (no slow-start needed)
+        # 2) Parallel GPT-5.2 calls
         # ----------------------------------------------------------
         def _generate_playbook(item: Dict[str, Any]) -> Dict[str, Any]:
             cid = item["cid"]
@@ -980,7 +980,7 @@ def run_phase3_common_processing(
                 return {"cid": cid, "status": "empty_output"}
 
             logging.info(
-                "[Phase3] cluster_id=%d (%s) – Pro returned: %s",
+                "[Phase3] cluster_id=%d (%s) – GPT-5.2 returned: %s",
                 cid, meta.get("cluster_key", "?"), content.get("title", "?")[:80],
             )
 
@@ -993,8 +993,8 @@ def run_phase3_common_processing(
                 "docs": docs,
             }
 
-        pool_workers = min(len(work_items), int(os.getenv("PHASE3_MINI_MAX_WORKERS", "8")))
-        logging.info("[phase3_common] Starting mini pool: %d items, workers=%d", len(work_items), pool_workers)
+        pool_workers = min(len(work_items), int(os.getenv("PHASE3_GPT52_MAX_WORKERS", "8")))
+        logging.info("[phase3_common] Starting gpt52 pool: %d items, workers=%d", len(work_items), pool_workers)
         from concurrent.futures import ThreadPoolExecutor, as_completed
         futures_map = {}
         with ThreadPoolExecutor(max_workers=pool_workers) as executor:
@@ -1074,7 +1074,7 @@ def run_phase3_common_processing(
                     json.dumps(content.get("verification") or [], ensure_ascii=False),
                     json.dumps(diagnostic_bundle, ensure_ascii=False),
                     area_path_id,
-                    "GPT-5-Pro",
+                    "GPT-5.2",
                 )
 
                 mark_threads_used_for_knowledge(
@@ -1090,8 +1090,11 @@ def run_phase3_common_processing(
                     "title": content.get("title"),
                 })
 
+        ok_count = sum(1 for r in results if isinstance(r, dict) and r.get("title"))
+
         return func.HttpResponse(
-            json.dumps(results, ensure_ascii=False), mimetype="application/json"
+            json.dumps({"status": "ok", "processed": ok_count, "details": results}, ensure_ascii=False),
+            mimetype="application/json",
         )
     except Exception as e:
         logging.exception("Common Processing Error")

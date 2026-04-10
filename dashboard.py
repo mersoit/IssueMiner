@@ -1370,45 +1370,51 @@ elif page == "⚙️ Pipelines":
 
             demo_phases = [
                 # ── Catalog build + leaf assignment (interleaved) ─────────────
-                # Special tuple with 5th element "interleave": after each 1B call
-                # that returns processed>0, a 2E call is fired before the next 1B.
-                ("Phase 1B – Cluster",       _1b_url, True,  240, _2e_url),
+                ("Phase 1B – Cluster",       _1b_url, True,  600, _2e_url),
                 ("Phase 1C – Emergent cluster",
                  f"{_FUNC_BASE}/phase1c_emergent_cluster?product={demo_product}&batch_size=10&limit=50{_b}",
                  False, 120, None),
                 # Final 2E drain after 1B fully done
-                ("Phase 2E – Assign leaf (final drain)", _2e_url, True,  240, None),
+                ("Phase 2E – Assign leaf (final drain)", _2e_url, True,  600, None),
                 ("Phase 2F – Emergent detect",
                  f"{_FUNC_BASE}/phase2f_detect_emergent?batch_size=10&max_batches=20{_b}",
                  False, 120, None),
-                # ── Count leaves BEFORE wiki/playbook phases ──────────────────
+                # ── Count leaves BEFORE playbook phases ───────────────────────
                 ("Phase 2G – Count leaves",
                  f"{_FUNC_BASE}/phase2g_count_leaves?product={demo_product}",
                  False,  60, None),
                 # ── Nugget mining ─────────────────────────────────────────────
                 ("Phase 4A – Nuggets",
                  f"{_FUNC_BASE}/phase4a_nugget_mining?limit={_batch}&product={demo_product}{_b}",
-                 True,  240, None),
+                 True,  600, None),
                 # ── Playbook generation ───────────────────────────────────────
                 ("Phase 3 – Common playbooks",
                  f"{_FUNC_BASE}/phase3_common?limit={_batch}&product={demo_product}&{_p3_thresh}",
-                 True,  240, None),
+                 True,  600, None),
                 ("Phase 3 – Push to wiki",
                  f"{_FUNC_BASE}/phase3_push?limit={demo_limit}",
                  False, 120, None),
                 # ── Wiki population ───────────────────────────────────────────
+                # Second 2G refresh so late-arriving leaves get correct counts
                 ("Phase 2G – Count leaves (refresh)",
                  f"{_FUNC_BASE}/phase2g_count_leaves?product={demo_product}",
                  False,  60, None),
+                # Second Phase 3 pass catches leaves created since first pass
+                ("Phase 3 – Common playbooks (pass 2)",
+                 f"{_FUNC_BASE}/phase3_common?limit={_batch}&product={demo_product}&{_p3_thresh}",
+                 True,  600, None),
+                ("Phase 3 – Push to wiki (pass 2)",
+                 f"{_FUNC_BASE}/phase3_push?limit={demo_limit}",
+                 False, 120, None),
                 ("Phase 4B – Variants wiki",
                  f"{_FUNC_BASE}/phase4b_populate_variants?limit={_batch}&product={demo_product}&{_p4b_thresh}",
-                 True,  240, None),
+                 True,  900, None),
                 ("Phase 4C – Scenarios wiki",
                  f"{_FUNC_BASE}/phase4c_populate_scenarios?limit={_batch}&product={demo_product}&{_p4c_thresh}&model=gpt52",
-                 True,  240, None),
+                 True,  900, None),
                 ("Phase 4D – Topics wiki",
                  f"{_FUNC_BASE}/phase4d_populate_topics?limit={_batch}&product={demo_product}&{_p4d_thresh}",
-                 True,  240, None),
+                 True,  600, None),
             ]
             # Tuple: (name, url, loop_until_empty, per_call_timeout_secs, interleave_url_or_None)
 
@@ -1451,6 +1457,9 @@ elif page == "⚙️ Pipelines":
                                     ok = False; break
                             suffix = f" ({call_n} calls)" if call_n > 1 else ""
                             _bg_log("pipeline_run", f"{'✅' if ok else '❌'} {phase_name}: {'OK' if ok else 'FAILED'} processed={grand}{suffix}")
+                            if not ok:
+                                _bg_log("pipeline_run", f"🛑 Pipeline aborted at {phase_name}")
+                                return {"product": product, "limit": limit, "phases": len(phases), "aborted_at": phase_name}
                         return {"product": product, "limit": limit, "phases": len(phases)}
 
                     _bg_task_start("pipeline_run", _run_pipeline, demo_phases, demo_product, demo_limit)

@@ -1508,6 +1508,8 @@ def run_phase1b_cluster(req: func.HttpRequest) -> func.HttpResponse:
         slice_limit = int(req.params.get("slice_limit", "800"))
         max_slices = int(req.params.get("max_slices", "4"))
 
+        product_param: Optional[str] = (req.params.get("product") or "").strip() or None
+
         limit = max(1, min(limit, 100000))
         batch_size = max(1, min(batch_size, 25))
         slice_limit = max(200, min(slice_limit, 2500))
@@ -1540,7 +1542,8 @@ def run_phase1b_cluster(req: func.HttpRequest) -> func.HttpResponse:
             cursor_ingested_at = None
             cursor_thread_id = None
 
-            chosen_product: Optional[str] = None
+            # If a product param was provided, lock to that product only.
+            chosen_product: Optional[str] = product_param
             seen_products: Set[str] = set()
             catalog_slice_start = 0
 
@@ -1550,6 +1553,9 @@ def run_phase1b_cluster(req: func.HttpRequest) -> func.HttpResponse:
                     break
 
                 if chosen_product is None:
+                    # If a product param was explicitly passed, don't hop to other products
+                    if product_param:
+                        break
                     chosen_product = fetch_next_common_product(cnx, force, exclude_products=seen_products, batch_id=batch_id)
                     if not chosen_product:
                         break
