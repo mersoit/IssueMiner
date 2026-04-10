@@ -637,7 +637,7 @@ def force_reset_2e_for_product(cnx: pyodbc.Connection, product: str) -> int:
     return n
 
 
-def force_reset_wiki_for_batch(cnx, batch_id: str,
+def force_reset_wiki_for_batch(cnx: pyodbc.Connection, batch_id: str, product: str) -> Dict[str, int]:
     """
     Clear wiki/playbook content on catalog clusters touched EXCLUSIVELY by
     this batch+product. If any thread from another batch maps to the same
