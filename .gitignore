@@ -133,3 +133,11 @@ __blobstorage__
 __queuestorage__
 __azurite_db*__.json
 .python_packages
+# Local scratch / debug artifacts (not part of the pipeline)
+.vs/
+test debug/
+_check_*
+_repush_*
+*.out.txt
+q
+.cost_ledger.json

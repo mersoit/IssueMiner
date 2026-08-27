@@ -37,6 +37,7 @@ import pyodbc
 import azure.functions as func
 from openai import AzureOpenAI
 
+from aoai_helpers import call_aoai_with_retry, estimate_tokens, get_rate_limiter
 from ado_devops import upsert_wiki_page
 from phase3_phase3_functions import _search_kb_articles
 from phase4b_populate_variants import _resolve_wiki_links
@@ -48,8 +49,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 _MAX_WORKERS = int(os.getenv("PHASE4D_MAX_WORKERS", "4"))
-_MAX_COMPLETION_TOKENS = int(os.getenv("PHASE4D_MAX_TOKENS", "4500"))
+_MAX_COMPLETION_TOKENS = int(os.getenv("PHASE4D_MAX_TOKENS", "6000"))
 _BATCH_SIZE = int(os.getenv("PHASE4D_BATCH_SIZE", "30"))
+_MAX_SCENARIOS_IN_PROMPT = int(os.getenv("PHASE4D_MAX_SCENARIOS", "20"))
 
 
 # ---------------------------------------------------------
@@ -259,7 +261,7 @@ def _fetch_scenarios_for_topic(
     cur = cnx.cursor()
     cur.execute(
         """
-        SELECT
+        SELECT TOP (?)
             s.cluster_id,
             s.cluster_key,
             s.cluster_signature_text,
@@ -271,6 +273,7 @@ def _fetch_scenarios_for_topic(
           AND s.is_active = 1
         ORDER BY s.member_count DESC, s.last_seen_at DESC
         """,
+        _MAX_SCENARIOS_IN_PROMPT,
         int(topic_cluster_id),
     )
     cols = [c[0] for c in cur.description]
@@ -281,7 +284,7 @@ def _fetch_scenarios_for_topic(
         sid = int(sc["cluster_id"])
         cur.execute(
             """
-            SELECT TOP 6
+            SELECT TOP 4
                 v.cluster_key,
                 v.cluster_signature_text,
                 v.member_count,
@@ -676,6 +679,23 @@ def generate_topic_wiki_content(
         "- Lab steps PHẢI dùng Azure CLI hoặc Portal — ưu tiên CLI cho reproducibility.\n"
         "- Nếu lab cần domain name, gợi ý dùng free subdomain services hoặc Azure DNS zone.\n"
         "- Nếu không chắc step nào hoạt động chính xác, đánh dấu [need confirmation].)\n"
+        "\n"
+        "IMAGES (USE SPARINGLY — AT MOST ONE PER PAGE)\n"
+        "- Only request an image when the topic genuinely needs one. For L1 topic pages, "
+        "prefer a high-level architecture/topology diagram ONLY when the service area has "
+        ">3 interacting components whose relationship is hard to describe in text.\n"
+        "- Portal screenshots at L1 are usually unnecessary; skip unless a specific "
+        "navigation path is repeatedly confusing.\n"
+        "- Do NOT request images for decoration.\n"
+        "- If you request an image, embed this EXACT block inline in the markdown at the "
+        "position it should appear (Phase 4E will generate + splice it in):\n"
+        "<!-- AZURE_IMAGE_REQUEST\n"
+        "kind: diagram | portal_screenshot\n"
+        "caption: <one short line shown under the image>\n"
+        "prompt: <specific prompt for gpt-image-2: list every component to include, "
+        "labelled arrows (1, 2, 3…) for the flow, layout direction, and what to emphasize>\n"
+        "-->\n"
+        "- The prompt must be self-contained; target <= 1500 characters.\n"
     )
 
     user_prompt = (
@@ -692,7 +712,14 @@ def generate_topic_wiki_content(
         "Generate the Markdown topic overview now."
     )
 
-    resp = client.chat.completions.create(
+    try:
+        from product_prompt_addons import append_product_addon as _append_addon
+        system_prompt = _append_addon(system_prompt, product, "phase4d")
+    except Exception:
+        pass
+
+    resp = call_aoai_with_retry(
+        client,
         model=deployment,
         messages=[
             {"role": "system", "content": system_prompt},
@@ -700,6 +727,9 @@ def generate_topic_wiki_content(
         ],
         max_completion_tokens=_MAX_COMPLETION_TOKENS,
         temperature=0.25,
+        estimated_prompt_tokens=estimate_tokens(system_prompt) + estimate_tokens(user_prompt),
+        rate_limiter=get_rate_limiter("gpt52"),
+        caller_tag="phase4d_topic",
     )
 
     content = (resp.choices[0].message.content or "").strip()
@@ -740,6 +770,10 @@ def _process_single_topic(
     }
 
     try:
+        if int(topic.get("member_count") or 0) <= 0:
+            result["status"] = "skipped_zero_members"
+            return result
+
         # --- Gather context ---
         with _sql_connect() as cnx:
             scenarios = _fetch_scenarios_for_topic(cnx, topic_id)

@@ -186,6 +186,20 @@ def ensure_tables(cnx: pyodbc.Connection) -> None:
     cur.execute(_BATCH_ID_INDEX_DDL)
     cnx.commit()
 
+    # Per-product prompt addons table (feature: product-specific prompt customization)
+    try:
+        from product_prompt_addons import ensure_table as _ensure_addons_table
+        _ensure_addons_table(cnx)
+    except Exception:
+        pass
+
+    # Phase 4E cluster_images table (feature: Azure UI/diagram images in wiki)
+    try:
+        from phase4e_generate_images import ensure_table as _ensure_cluster_images
+        _ensure_cluster_images(cnx)
+    except Exception:
+        pass
+
 
 # ─────────────────────────────────────────────────────────
 # Batch management
@@ -238,18 +252,37 @@ def list_batches(cnx: pyodbc.Connection) -> List[Dict[str, Any]]:
     cur = cnx.cursor()
     cur.execute("""
         SELECT
-            batch_id,
-            COUNT(*)                                                        AS total_threads,
-            COUNT(DISTINCT product)                                         AS products,
-            SUM(CASE WHEN CatalogCheckedUtc  IS NULL THEN 1 ELSE 0 END)    AS pending_1b,
-            SUM(CASE WHEN AssignmentCompletedUtc IS NULL THEN 1 ELSE 0 END) AS pending_2e,
-            SUM(CASE WHEN NuggetsMinedUtc    IS NULL THEN 1 ELSE 0 END)    AS pending_4a,
-            MIN(ingested_at)                                                AS oldest,
-            MAX(ingested_at)                                                AS newest
-        FROM dbo.thread_enrichment
-        WHERE batch_id IS NOT NULL
-        GROUP BY batch_id
-        ORDER BY MAX(ingested_at) DESC
+            b.batch_id,
+            b.total_threads,
+            b.product_names,
+            b.product_count,
+            b.pending_1b,
+            b.pending_2e,
+            b.pending_4a,
+            b.oldest,
+            b.newest
+        FROM (
+            SELECT
+                te.batch_id,
+                COUNT(*)                                                        AS total_threads,
+                COUNT(DISTINCT te.product)                                      AS product_count,
+                STUFF((
+                    SELECT DISTINCT ', ' + te2.product
+                    FROM dbo.thread_enrichment te2
+                    WHERE te2.batch_id = te.batch_id
+                      AND te2.product IS NOT NULL AND LTRIM(RTRIM(te2.product)) <> ''
+                    FOR XML PATH(''), TYPE
+                ).value('.', 'nvarchar(max)'), 1, 2, '')                        AS product_names,
+                SUM(CASE WHEN te.CatalogCheckedUtc  IS NULL THEN 1 ELSE 0 END)  AS pending_1b,
+                SUM(CASE WHEN te.AssignmentCompletedUtc IS NULL THEN 1 ELSE 0 END) AS pending_2e,
+                SUM(CASE WHEN te.NuggetsMinedUtc    IS NULL THEN 1 ELSE 0 END)  AS pending_4a,
+                MIN(te.ingested_at)                                             AS oldest,
+                MAX(te.ingested_at)                                             AS newest
+            FROM dbo.thread_enrichment te
+            WHERE te.batch_id IS NOT NULL
+            GROUP BY te.batch_id
+        ) b
+        ORDER BY b.newest DESC
     """)
     cols = [c[0] for c in cur.description]
     return [dict(zip(cols, row)) for row in cur.fetchall()]

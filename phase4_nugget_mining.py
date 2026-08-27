@@ -38,6 +38,27 @@ _PASS2_MAX_COMPLETION_TOKENS = int(os.environ.get("PHASE4_PASS2_MAX_TOKENS", "80
 _MAX_WORKERS = int(os.environ.get("PHASE4_MAX_WORKERS", "20"))
 
 
+def _is_content_filter_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return (
+        "content_filter" in msg
+        or "responsibleaipolicyviolation" in msg
+        or "content management policy" in msg
+    )
+
+
+def _slim_proposed_for_pass2(proposed: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "nugget_type": (proposed.get("nugget_type") or "")[:100],
+        "cluster_id": proposed.get("cluster_id"),
+        "title": (proposed.get("title") or "")[:200],
+        "draft_content": (proposed.get("draft_content") or "")[:500],
+        "why_it_matters": (proposed.get("why_it_matters") or "")[:300],
+        "evidence_quote": (proposed.get("evidence_quote") or "")[:200],
+        "search_queries": [],
+    }
+
+
 # -------------------------
 # SQL helpers
 # -------------------------
@@ -281,6 +302,12 @@ def extract_nuggets_pass1(
         "catalog": cat_lines,
     }
 
+    try:
+        from product_prompt_addons import append_product_addon as _append_addon
+        system_prompt = _append_addon(system_prompt, (thread.get("product") or "").strip(), "phase4a")
+    except Exception:
+        pass
+
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
@@ -454,6 +481,7 @@ def _process_single_thread(
         "proposed": 0,
         "kept": 0,
         "discarded": 0,
+        "filtered": 0,
         "nuggets": [],
     }
 
@@ -514,13 +542,41 @@ def _process_single_thread(
                 len(docs),
             )
 
-            evaluated = evaluate_nugget_pass2(
-                client_pass2,
-                deployment_pass2,
-                t,
-                nugget,
-                docs,
-            )
+            try:
+                evaluated = evaluate_nugget_pass2(
+                    client_pass2,
+                    deployment_pass2,
+                    t,
+                    nugget,
+                    docs,
+                )
+            except Exception as e:
+                if not _is_content_filter_error(e):
+                    raise
+                logging.warning(
+                    "Phase4A Pass2 content filter: thread_id=%s cluster_id=%d retrying with slim payload/no docs",
+                    thread_id,
+                    proposed_cid_int,
+                )
+                try:
+                    evaluated = evaluate_nugget_pass2(
+                        client_pass2,
+                        deployment_pass2,
+                        t,
+                        _slim_proposed_for_pass2(nugget),
+                        [],
+                    )
+                except Exception as retry_e:
+                    if _is_content_filter_error(retry_e):
+                        logging.warning(
+                            "Phase4A Pass2 content filter persisted: thread_id=%s cluster_id=%d discarding nugget",
+                            thread_id,
+                            proposed_cid_int,
+                        )
+                        result["discarded"] += 1
+                        result["filtered"] += 1
+                        continue
+                    raise
 
             action = (evaluated.get("action") or "").strip().lower()
             score_val = evaluated.get("usefulness_score")
@@ -541,6 +597,18 @@ def _process_single_thread(
             evaluated["cluster_level"] = int(catalog_node.get("cluster_level") or 0)
             evaluated["cluster_key"] = (catalog_node.get("cluster_key") or "").strip()
             evaluated["target_level"] = "topic" if evaluated["cluster_level"] == 1 else "scenario"
+
+            # Keys must describe the node the model selected. The thread's Phase 1 hints often
+            # name nodes that never made it into the catalog, which orphans the nugget.
+            node_key = evaluated["cluster_key"]
+            if evaluated["cluster_level"] == 1:
+                evaluated["topic_cluster_key"] = node_key
+                evaluated["scenario_cluster_key"] = ""
+            else:
+                parent_id = catalog_node.get("parent_cluster_id")
+                parent = by_id.get(int(parent_id)) if parent_id is not None else None
+                evaluated["topic_cluster_key"] = ((parent or {}).get("cluster_key") or "").strip()
+                evaluated["scenario_cluster_key"] = node_key
 
             kept_nuggets.append(evaluated)
             result["kept"] += 1
@@ -621,8 +689,8 @@ def _upsert_nugget_to_db(
     score = float(nugget.get("usefulness_score") or 0.0)
 
     target_level = (nugget.get("target_level") or "").strip()[:50]
-    topic_key = (thread.get("topic_cluster_key") or "").strip()[:500]
-    scenario_key = (thread.get("scenario_cluster_key") or "").strip()[:500]
+    topic_key = (nugget.get("topic_cluster_key") or "").strip()[:500]
+    scenario_key = (nugget.get("scenario_cluster_key") or "").strip()[:500]
 
     # EvidenceJson: store as a JSON string so the nvarchar column stays queryable
     evidence_raw = nugget.get("evidence_quote") or nugget.get("evidence") or ""

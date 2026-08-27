@@ -32,6 +32,7 @@ import pyodbc
 import azure.functions as func
 from openai import AzureOpenAI
 
+from aoai_helpers import call_aoai_with_retry, estimate_tokens, get_rate_limiter
 from ado_devops import upsert_wiki_page
 
 # ---------------------------------------------------------
@@ -601,6 +602,23 @@ def generate_variant_wiki_content(
         "## See Also\n"
         "(List 2-4 variant/scenario keys liên quan mà engineer có thể nhầm lẫn. "
         "Format: - [[key]] – cách phân biệt với page này, viết bằng tiếng Việt.)\n"
+        "\n"
+        "IMAGES (USE SPARINGLY — AT MOST ONE PER PAGE)\n"
+        "- Only request an image when it would clearly save engineer time AND the "
+        "content is genuinely complex or visually-specific.\n"
+        "  Good cases: a portal blade where many fields interact and is NOT self-explanatory; "
+        "a small topology with >3 components whose relationship is hard to describe in text.\n"
+        "  Do NOT request images for simple UIs, single-field settings, or as decoration.\n"
+        "- If you request an image, embed this EXACT block inline in the markdown at the "
+        "place it should appear (Phase 4E will generate + splice it in):\n"
+        "<!-- AZURE_IMAGE_REQUEST\n"
+        "kind: diagram | portal_screenshot\n"
+        "caption: <one short line shown under the image>\n"
+        "prompt: <very specific prompt for gpt-image-2: for portal screenshots name the "
+        "exact blade/tab/fields to show and what to highlight; for diagrams list every "
+        "component, arrows with labels, and desired layout>\n"
+        "-->\n"
+        "- The prompt must be self-contained (no 'see above'); target <= 1500 characters.\n"
     )
 
     user_prompt = (
@@ -612,7 +630,14 @@ def generate_variant_wiki_content(
         "Generate the Markdown variant guide now."
     )
 
-    resp = client.chat.completions.create(
+    try:
+        from product_prompt_addons import append_product_addon as _append_addon
+        system_prompt = _append_addon(system_prompt, product, "phase4b")
+    except Exception:
+        pass
+
+    resp = call_aoai_with_retry(
+        client,
         model=deployment,
         messages=[
             {"role": "system", "content": system_prompt},
@@ -620,6 +645,9 @@ def generate_variant_wiki_content(
         ],
         max_completion_tokens=_MAX_COMPLETION_TOKENS,
         temperature=0.2,
+        estimated_prompt_tokens=estimate_tokens(system_prompt) + estimate_tokens(user_prompt),
+        rate_limiter=get_rate_limiter("gpt52"),
+        caller_tag="phase4b_variant",
     )
 
     content = (resp.choices[0].message.content or "").strip()
@@ -660,6 +688,10 @@ def _process_single_variant(
     }
 
     try:
+        if int(variant.get("member_count") or 0) <= 0:
+            result["status"] = "skipped_zero_members"
+            return result
+
         with _sql_connect() as cnx:
             leaves = _fetch_leaves_for_variant(cnx, variant_id)
             sample_threads = _fetch_sample_threads_for_variant(cnx, variant_id, top_n=8)

@@ -19,6 +19,7 @@ Callable as:
 import os
 import re
 import json
+import math
 import html as html_mod
 import time
 import logging
@@ -135,6 +136,73 @@ def _build_page_url(base_url: str, page: int) -> str:
     qs = parse_qs(parsed.query)
     qs["page"] = [str(page)]
     return urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+
+
+def _extract_tag_total(html: str) -> int:
+    """
+    Read the tag's question total from the listing header, e.g.
+    "4,308 questions with Microsoft Copilot-related tags".
+
+    Only this phrasing is the tag total. The sidebar renders many other
+    "<n> questions" values (data-test-id="tag-card-count-...") for related
+    tags, so a generic "<n> questions" match picks the wrong number.
+    """
+    m = re.search(r'([\d,]+)\s*(?:&nbsp;|\s)*questions\s+with\b', html, re.IGNORECASE)
+    if not m:
+        return 0
+    try:
+        return int(m.group(1).replace(",", ""))
+    except ValueError:
+        return 0
+
+
+def _detect_last_page(
+    tag_url: str,
+    first_html: str,
+    max_pages: int = 9999,
+    session: Optional[requests.Session] = None,
+) -> int:
+    """
+    Find the real last listing page.
+
+    The pagination control only renders a window ("1 2 3 4 ... 10 Next"), so its
+    numbers are a lower bound. Probing for an empty page is also unsafe: past a
+    tag's real range Microsoft Q&A silently serves the unfiltered global list,
+    which never runs out. The header total is therefore the authoritative signal.
+    """
+    per_page = len(_extract_question_links(first_html)) or 20
+
+    total = _extract_tag_total(first_html)
+    if total > 0:
+        pages = max(1, math.ceil(total / per_page))
+        logging.info(
+            "phase0 tag_total=%d per_page=%d -> %d pages", total, per_page, pages,
+        )
+        return min(pages, max_pages)
+
+    # Fallback: no header total. Probe outward, but only trust an empty page.
+    logging.warning("phase0 no tag total in header; falling back to probing")
+
+    def has_results(pg: int) -> bool:
+        try:
+            return bool(_extract_question_links(_fetch(_build_page_url(tag_url, pg), session)))
+        except Exception as e:
+            logging.warning("phase0 probe page=%d failed: %s", pg, str(e)[:160])
+            return False
+
+    lo = max(1, min(_extract_last_page(first_html), max_pages))
+    hi = lo * 2
+    while hi <= max_pages and has_results(hi):
+        lo = hi
+        hi *= 2
+    hi = min(hi, max_pages + 1)
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if has_results(mid):
+            lo = mid
+        else:
+            hi = mid
+    return min(lo, max_pages)
 
 
 # -----------------------------------------------------------
@@ -350,8 +418,11 @@ def crawl_tag_url(
 
     # -- pagination --
     first_html = _fetch(_build_page_url(tag_url, 1), sess)
-    last_page = min(_extract_last_page(first_html), max_pages)
-    logging.info("phase0 last_page=%d", last_page)
+    last_page = _detect_last_page(tag_url, first_html, max_pages, sess)
+    logging.info(
+        "phase0 last_page=%d (pagination hint was %d)",
+        last_page, _extract_last_page(first_html),
+    )
 
     # -- listing pages --
     all_links: List[Dict[str, str]] = []

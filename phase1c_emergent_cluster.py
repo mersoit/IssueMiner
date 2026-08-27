@@ -551,17 +551,19 @@ def run_phase1c_emergent_cluster(req: func.HttpRequest) -> func.HttpResponse:
 
                 candidates: Dict[str, Dict[str, Any]] = {}
                 prev_keys: Optional[set] = None
-                catalog_slice_start = 0
 
                 for slice_index in range(1, effective_slices + 1):
-                    window = _catalog_window(catalog_rows, start=catalog_slice_start, size=slice_limit)
+                    # Offset derives from slice_index; a cursor advanced after the window
+                    # was built made slice 2 re-show slice 1's rows.
+                    slice_start = (slice_index - 1) * slice_limit
+                    if slice_index > 1 and slice_start >= len(catalog_rows):
+                        break
+
+                    window = _catalog_window(catalog_rows, start=slice_start, size=slice_limit)
                     slim_slice = _build_slim_catalog_slice(window)
                     # Include topics from prior batches so Nano can reuse them
                     if cross_batch_topics:
                         slim_slice = cross_batch_topics + slim_slice
-
-                    if slice_index > 1 and len(catalog_rows) > slice_limit:
-                        catalog_slice_start = (catalog_slice_start + slice_limit) % max(1, len(catalog_rows))
 
                     if slice_index == 1:
                         out = call_nano_emergent_propose(

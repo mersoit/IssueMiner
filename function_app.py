@@ -29,6 +29,10 @@ from phase4_nugget_mining import run_phase4a_nugget_mining
 from phase4b_populate_variants import run_phase4b_populate_variants
 from phase4c_populate_scenarios import run_phase4c_populate_scenarios
 from phase4d_populate_topics import run_phase4d_populate_topics
+from phase4e_generate_images import (
+    run_phase4e_assess_and_illustrate,
+    run_phase4e_generate_images,
+)
 
 app = func.FunctionApp()
 
@@ -137,7 +141,8 @@ def phase3_common_route(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="phase3_push", methods=["GET", "POST"])
 def phase3_push_route(req: func.HttpRequest) -> func.HttpResponse:
     limit = int(req.params.get("limit", "50"))
-    return push_phase3_to_devops(limit)
+    product = (req.params.get("product") or "").strip()
+    return push_phase3_to_devops(limit, product=product)
 
 @app.route(route="phase3_search_selftest", methods=["GET", "POST"])
 def phase3_search_selftest_route(req: func.HttpRequest) -> func.HttpResponse:
@@ -185,3 +190,28 @@ def phase4d_populate_topics_route(req: func.HttpRequest) -> func.HttpResponse:
       - /api/phase4d_populate_topics?min_members=1&require_child_wiki=0
     """
     return run_phase4d_populate_topics(req)
+
+@app.route(route="phase4e_generate_images", methods=["GET", "POST"])
+def phase4e_generate_images_route(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Generate diagrams / portal screenshots requested by phases 4B/4C/4D and
+    splice them back into the wiki markdown. Rate-limited to ~2 images/min.
+    Examples:
+      - /api/phase4e_generate_images
+      - /api/phase4e_generate_images?product=Redis&limit=4
+      - /api/phase4e_generate_images?scan_only=1
+    """
+    return run_phase4e_generate_images(req)
+
+
+@app.route(route="phase4e_illustrate", methods=["GET", "POST"])
+def phase4e_illustrate_route(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Read published wiki pages, judge whether a diagram is genuinely warranted,
+    then generate + splice + push. Insertion is additive only.
+    Examples:
+      - /api/phase4e_illustrate?product=M365 Copilot&levels=1
+      - /api/phase4e_illustrate?product=M365 Copilot&levels=1,2&assess_only=1
+      - /api/phase4e_illustrate?product=Redis&levels=1&limit=30&max_images=10
+    """
+    return run_phase4e_assess_and_illustrate(req)

@@ -116,6 +116,44 @@ def update_work_item(
 
 
 # ---- Wiki ----
+def upload_wiki_attachment(
+    wiki_id: str,
+    name: str,
+    content: bytes,
+) -> Optional[str]:
+    """Upload a binary attachment to a wiki and return its markdown-referencable path.
+
+    Attachments live inside the wiki itself, so images render without a public
+    storage container or SAS. Returns e.g. '/.attachments/foo.png'.
+    A 409 means the name already exists, which is treated as success.
+    """
+    safe = urllib.parse.quote(name, safe="")
+    url = (
+        f"{_org_url()}/{_project_url_encoded()}/_apis/wiki/wikis/"
+        f"{urllib.parse.quote(wiki_id)}/attachments?name={safe}&api-version=7.1-preview.1"
+    )
+    headers = _ado_headers()
+    headers["Content-Type"] = "application/octet-stream"
+
+    try:
+        # The attachments API expects the payload base64-encoded, not raw bytes.
+        r = requests.put(url, headers=headers, data=base64.b64encode(content), timeout=120)
+    except Exception as e:
+        logging.error("[ado] attachment upload failed name=%s err=%s", name, str(e)[:300])
+        return None
+
+    if r.status_code in (200, 201):
+        try:
+            return r.json().get("path") or f"/.attachments/{name}"
+        except Exception:
+            return f"/.attachments/{name}"
+    if r.status_code == 409:
+        return f"/.attachments/{name}"
+
+    logging.error("[ado] attachment upload %s -> %s %s", name, r.status_code, r.text[:300])
+    return None
+
+
 def upsert_wiki_page(
     wiki_id: str,
     path: str,

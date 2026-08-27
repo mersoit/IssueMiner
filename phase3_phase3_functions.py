@@ -607,7 +607,7 @@ def generate_gpt5_common_leaf_support_playbook(context: Dict[str, Any]) -> Dict[
     )
 
     try:
-        return call_aoai_with_retry(
+        resp = call_aoai_with_retry(
             client,
             model=deployment,
             messages=[
@@ -621,6 +621,8 @@ def generate_gpt5_common_leaf_support_playbook(context: Dict[str, Any]) -> Dict[
             rate_limiter=get_rate_limiter("gpt52"),
             caller_tag="phase3_leaf_gpt52",
         )
+        raw = (resp.choices[0].message.content or "").strip()
+        return json.loads(raw) if raw else {}
     except Exception as e:
         logging.error(
             "GPT-5.2 common_leaf playbook generation failed for cluster %s: %s",
@@ -944,7 +946,11 @@ def run_phase3_common_processing(
 
         if not work_items:
             return func.HttpResponse(
-                json.dumps([], ensure_ascii=False), mimetype="application/json"
+                json.dumps(
+                    {"status": "ok", "processed": 0, "details": [], "msg": "no common playbook candidates"},
+                    ensure_ascii=False,
+                ),
+                mimetype="application/json",
             )
 
         logging.info(
@@ -1137,7 +1143,7 @@ def run_phase3_search_selftest(req: func.HttpRequest) -> func.HttpResponse:
         )
 
 
-def push_phase3_to_devops(limit: int = 50) -> func.HttpResponse:
+def push_phase3_to_devops(limit: int = 50, product: str = "") -> func.HttpResponse:
     """Push unpushed CommonIssueSolutions to ADO Wiki.
 
     Wiki path is built from the issue_cluster parent chain:
@@ -1146,6 +1152,10 @@ def push_phase3_to_devops(limit: int = 50) -> func.HttpResponse:
     This aligns with Phase 4B (variant @ L3), 4C (scenario @ L2),
     4D (topic @ L1).  The leaf playbook page lives directly at the
     L4 cluster_key segment — no extra title child page.
+
+    Args:
+        product: optional product name filter (e.g. 'Virtual Network').
+                 When set, only pushes CIS rows for that product's clusters.
     """
     work_item_type = os.getenv("ADO_WORKITEM_TYPE", "Issue")
     wiki_id = os.environ["ADO_WIKI_ID"]
@@ -1181,7 +1191,12 @@ def push_phase3_to_devops(limit: int = 50) -> func.HttpResponse:
             cursor = cnx.cursor()
 
             # Common -> Wiki (path derives from issue_cluster parent chain)
-            cursor.execute("""
+            product = (product or "").strip()
+            prod_filter = "AND c.product = ?" if product else ""
+            push_args = [int(limit)]
+            if product:
+                push_args.append(product)
+            cursor.execute(f"""
                 SELECT TOP (?)
                     cis.ClusterID,
                     cis.Title,
@@ -1189,8 +1204,10 @@ def push_phase3_to_devops(limit: int = 50) -> func.HttpResponse:
                     cis.ValidationChecks,
                     cis.DiagnosticLogicJson
                 FROM dbo.CommonIssueSolutions cis
+                INNER JOIN dbo.issue_cluster c ON c.cluster_id = cis.ClusterID
                 WHERE cis.AdoPushedUtc IS NULL
-            """, limit)
+                {prod_filter}
+            """, *push_args)
 
             common_rows = [dict(zip([c[0] for c in cursor.description], r)) for r in cursor.fetchall()]
 

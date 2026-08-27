@@ -236,14 +236,14 @@ def call_nano_llm(thread_id: str, content_for_llm: str, known_products: Optional
             "  Rules (follow in order):\n"
             "  1. Copy the EXACT string from the list — same spelling, same casing, same spacing. Do NOT paraphrase, abbreviate, or expand it.\n"
             "  2. If two entries look similar (e.g. 'Front Door' and 'Frontdoor'), pick the one that is already in the list; never invent a variant.\n"
-            "  3. Only create a new product name if the thread clearly belongs to an Azure service that has NO match in the list.\n"
-            "     In that case use the short official service name without the 'Azure' prefix.\n"
-            "  4. If it is not an Azure service, use 'Other'.\n"
+            "  3. Only create a new product name if the thread clearly belongs to an Azure or Microsoft service that has NO match in the list.\n"
+            "     In that case use the short official service name without the 'Azure' or 'Microsoft' prefix.\n"
+            "  4. If it is not an Azure or Microsoft service, use 'Other'.\n"
         )
     else:
         product_instruction = (
             "- product: one of Azure services [System Center Operations Manager, System Center Orchestrator, System Center Service Manager, DevOps, Web Apps, Functions, Static Web Apps, App Service, Redis, Storage Account, Logic Apps, Ai Search, Service Bus, Event Grid, Event Hub, APIM, ARM, Policy, Virtual Network, Monitor, System Center]. "
-            "If it belongs to another Azure Service then list that Service without the Azure prefix. If it's not Azure Service note as Other'\n"
+            "If it belongs to another Azure or Microsoft Service then list that Service without the Azure or Microsoft prefix. If it's not Azure or Microsoft Service note as Other'\n"
         )
 
     system = (
@@ -473,7 +473,7 @@ _SEED_PRODUCTS: List[str] = [
     "App Service", "Redis", "Storage Account", "Logic Apps",
     "Ai Search", "Service Bus", "Event Grid", "Event Hub",
     "ARM", "Policy", "Virtual Network", "Monitor", "OpenAI",
-    "Entra External ID", "System Center", "Internet Information Services",
+    "Entra External ID", "System Center", "Internet Information Services", "Edge Browser", "Local", "Arc", "Windows Hyper-V"
 ]
 
 
@@ -685,11 +685,19 @@ def map_llm_to_db_payload(
     variant_key = _norm_space(_safe_str(llm_json.get("variant_cluster_key", "")).strip())[:300]
     res_leaf_key = _norm_space(_safe_str(llm_json.get("resolution_leaf_key", "")).strip())[:350]
 
+    # Fallbacks must not copy a key down levels or leave a child without its parent: Phase 1B
+    # requires each child key to differ from its parent and rejects broken chains.
     if not topic_key:
-        topic_key = f"{product}:unknown"
-    if not scenario_key: scenario_key = topic_key
-    if not variant_key: variant_key = scenario_key
-    if not res_leaf_key: res_leaf_key = f"{variant_key}__unknown"
+        topic_key = "unknown-topic"
+    if scenario_key in (topic_key, ""):
+        scenario_key = ""
+        variant_key = ""
+    if variant_key in (scenario_key, topic_key):
+        variant_key = ""
+    if not variant_key:
+        res_leaf_key = ""
+    elif not res_leaf_key:
+        res_leaf_key = f"{variant_key}__unknown-resolution"
 
     sig_text = _norm_space(_safe_str(llm_json.get("signature_text", "")).strip())
     res_sig_text = _norm_space(_safe_str(llm_json.get("resolution_signature_text", "")).strip())

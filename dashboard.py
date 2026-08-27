@@ -103,8 +103,17 @@ st.set_page_config(
 # set to True immediately when a task is launched, so the button is
 # disabled on the very next render before _BG_TASKS is even checked.
 
-_BG_TASKS: Dict[str, Any] = {}
-_BG_LOCK = threading.Lock()
+@st.cache_resource
+def _get_bg_runtime() -> Dict[str, Any]:
+    return {
+        "tasks": {},
+        "lock": threading.Lock(),
+    }
+
+
+_BG_RUNTIME = _get_bg_runtime()
+_BG_TASKS: Dict[str, Any] = _BG_RUNTIME["tasks"]
+_BG_LOCK = _BG_RUNTIME["lock"]
 
 
 def _bg_task_start(task_key: str, fn, *args, **kwargs) -> None:
@@ -132,7 +141,7 @@ def _bg_task_start(task_key: str, fn, *args, **kwargs) -> None:
                 _BG_TASKS[task_key]["status"] = "error"
                 _BG_TASKS[task_key]["result"] = str(e)
 
-    threading.Thread(target=_run, daemon=True).start()
+    threading.Thread(target=_run, daemon=False).start()
 
 
 def _bg_log(task_key: str, msg: str) -> None:
@@ -142,38 +151,30 @@ def _bg_log(task_key: str, msg: str) -> None:
             _BG_TASKS[task_key]["log"].append(msg)
 
 
-def _bg_task_ui(task_key: str, title: str) -> bool:
-    """
-    Render status widget for a background task.
-    Returns True while the task is still running.
-    Auto-refreshes the page every 3 seconds via a meta-refresh tag
-    (no sleep — does not block the Streamlit thread).
-    """
-    # Sync: if task finished, clear the session_state started flag
+def _render_bg_task_ui_state(task_key: str, title: str, auto_refresh: bool) -> bool:
+    """Render one background-task status widget from current shared state."""
     with _BG_LOCK:
         state = dict(_BG_TASKS.get(task_key) or {})
 
     if not state:
-        # Task not in _BG_TASKS — could be cleared or never started
         st.session_state.pop(f"_bg_started_{task_key}", None)
         return False
 
     status = state.get("status", "unknown")
-    log    = list(state.get("log") or [])
+    log = list(state.get("log") or [])
 
     if status == "running":
         st.info(f"⏳ **{title}** is running…")
         if log:
             with st.expander("Live log", expanded=True):
                 st.text("\n".join(log[-40:]))
-        # Auto-refresh every 3 seconds without blocking the thread
-        st.markdown(
-            '<meta http-equiv="refresh" content="3">',
-            unsafe_allow_html=True,
-        )
+        if auto_refresh:
+            st.markdown(
+                '<meta http-equiv="refresh" content="3">',
+                unsafe_allow_html=True,
+            )
         return True
 
-    # Task finished — clear started flag so button re-enables
     st.session_state.pop(f"_bg_started_{task_key}", None)
 
     if status == "done":
@@ -181,7 +182,10 @@ def _bg_task_ui(task_key: str, title: str) -> bool:
         result = state.get("result")
         if result:
             with st.expander("Result", expanded=False):
-                st.json(result) if isinstance(result, (dict, list)) else st.text(str(result))
+                if isinstance(result, (dict, list)):
+                    st.json(result)
+                else:
+                    st.text(str(result))
         if log:
             with st.expander("Log", expanded=False):
                 st.text("\n".join(log))
@@ -202,7 +206,25 @@ def _bg_task_ui(task_key: str, title: str) -> bool:
             st.rerun()
         return False
 
+    st.warning(f"Task '{title}' is in unknown state: {status}")
     return False
+
+
+def _bg_task_ui(task_key: str, title: str) -> bool:
+    """Render status widget for a background task."""
+    with _BG_LOCK:
+        state = dict(_BG_TASKS.get(task_key) or {})
+    running = bool(state) and state.get("status") == "running"
+
+    if hasattr(st, "fragment"):
+        @st.fragment(run_every="3s")
+        def _bg_task_fragment() -> None:
+            _render_bg_task_ui_state(task_key, title, auto_refresh=False)
+
+        _bg_task_fragment()
+        return running
+
+    return _render_bg_task_ui_state(task_key, title, auto_refresh=True)
 
 
 def _is_bg_running(task_key: str) -> bool:
@@ -212,6 +234,108 @@ def _is_bg_running(task_key: str) -> bool:
             return True
     # Fallback: thread started but hasn't written to _BG_TASKS yet
     return bool(st.session_state.get(f"_bg_started_{task_key}"))
+
+
+def _build_demo_phases(product: str, limit: int, batch_id: str = "", demo_mode: bool = True):
+    _FUNC_BASE = "http://localhost:7071/api"
+    _b = f"&batch_id={batch_id.strip()}" if (batch_id or "").strip() else ""
+
+    _p3_thresh = "min_members=1&min_usefulness=0.3" if demo_mode else "min_members=2&min_usefulness=0.6"
+    _p4b_thresh = "min_members=0&min_usefulness=0.0" if demo_mode else "min_members=3&min_usefulness=0.4"
+    _p4c_thresh = "min_members=0&child_min_members=0" if demo_mode else "min_members=6&child_min_members=3"
+    _p4d_thresh = "min_members=0&require_child_wiki=0" if demo_mode else "min_members=1&require_child_wiki=1"
+
+    _batch = min(int(limit), 20)
+    _1b_url = f"{_FUNC_BASE}/phase1b_cluster?product={product}&batch_size=5&max_batches=20{_b}"
+    _2e_url = f"{_FUNC_BASE}/phase2e_assign_leaf?batch_size=10&max_batches=20&product={product}{_b}"
+
+    return [
+        ("Phase 1B – Cluster", _1b_url, True, 600, _2e_url),
+        ("Phase 1C – Emergent cluster", f"{_FUNC_BASE}/phase1c_emergent_cluster?product={product}&batch_size=10&limit=50{_b}", False, 120, None),
+        ("Phase 2E – Assign leaf (final drain)", _2e_url, True, 600, None),
+        ("Phase 2F – Emergent detect", f"{_FUNC_BASE}/phase2f_detect_emergent?batch_size=10&max_batches=20{_b}", False, 120, None),
+        ("Phase 2G – Count leaves", f"{_FUNC_BASE}/phase2g_count_leaves?product={product}", False, 180, None),
+        ("Phase 4A – Nuggets", f"{_FUNC_BASE}/phase4a_nugget_mining?limit={_batch}&product={product}{_b}", True, 600, None),
+        ("Phase 3 – Common playbooks", f"{_FUNC_BASE}/phase3_common?limit={_batch}&product={product}&{_p3_thresh}", True, 600, None),
+        ("Phase 3 – Push to wiki", f"{_FUNC_BASE}/phase3_push?limit={limit}&product={product}", False, 120, None),
+        ("Phase 2G – Count leaves (refresh)", f"{_FUNC_BASE}/phase2g_count_leaves?product={product}", False, 180, None),
+        ("Phase 3 – Common playbooks (pass 2)", f"{_FUNC_BASE}/phase3_common?limit={_batch}&product={product}&{_p3_thresh}", True, 600, None),
+        ("Phase 3 – Push to wiki (pass 2)", f"{_FUNC_BASE}/phase3_push?limit={limit}&product={product}", False, 120, None),
+        ("Phase 4B – Variants wiki", f"{_FUNC_BASE}/phase4b_populate_variants?limit={_batch}&product={product}&{_p4b_thresh}", True, 900, None),
+        ("Phase 4C – Scenarios wiki", f"{_FUNC_BASE}/phase4c_populate_scenarios?limit={_batch}&product={product}&{_p4c_thresh}&model=gpt52", True, 900, None),
+        ("Phase 4D – Topics wiki", f"{_FUNC_BASE}/phase4d_populate_topics?limit={_batch}&product={product}&{_p4d_thresh}", True, 600, None),
+        ("Phase 4E – Images (diagrams/screenshots)", f"{_FUNC_BASE}/phase4e_generate_images?product={product}&limit=4", True, 900, None),
+        ("Phase 4E – Illustrate topics (assessed)", f"{_FUNC_BASE}/phase4e_illustrate?product={product}&levels=1&limit={_batch}&max_images={limit}", True, 1800, None),
+    ]
+
+
+def _run_pipeline_worker(phases, product: str, limit: int, task_key: str = "pipeline_run"):
+    import requests as _rq
+
+    def _is_transient_phase_failure(resp=None, err=None):
+        if resp is not None and int(getattr(resp, "status_code", 0) or 0) == 499:
+            return True
+        msg = str(err or "")
+        msg_l = msg.lower()
+        return (
+            "task was canceled" in msg_l
+            or "timed out" in msg_l
+            or "read timed out" in msg_l
+            or "connection aborted" in msg_l
+        )
+
+    for phase_name, url, loop, timeout, interleave_url in phases:
+        grand, call_n, ok = 0, 0, True
+        _bg_log(task_key, f"▶ Starting {phase_name}")
+        while True:
+            call_n += 1
+            processed = None
+            attempt, max_attempts = 0, 2
+            while attempt < max_attempts:
+                attempt += 1
+                try:
+                    r = _rq.post(url, timeout=timeout)
+                    body = r.json() if "json" in r.headers.get("content-type", "") else {}
+                    if isinstance(body, list):
+                        body = {"processed": len(body), "details": body}
+                    elif not isinstance(body, dict):
+                        body = {}
+                    if r.status_code != 200:
+                        if attempt < max_attempts and _is_transient_phase_failure(resp=r):
+                            _bg_log(task_key, f"↻ {phase_name}: transient HTTP {r.status_code}, retrying once")
+                            continue
+                        _bg_log(task_key, f"⚠️ {phase_name}: HTTP {r.status_code}")
+                        ok = False
+                        break
+                    processed = int(body.get("processed", body.get("ingested", 0)) or 0)
+                    grand += processed
+                    _bg_log(task_key, f"  {phase_name} call {call_n}: +{processed} (total {grand})")
+                    if interleave_url and processed > 0:
+                        try:
+                            ri = _rq.post(interleave_url, timeout=timeout)
+                            bi = ri.json() if "json" in ri.headers.get("content-type", "") else {}
+                            pi = int(bi.get("processed", 0) or 0) if isinstance(bi, dict) else 0
+                            _bg_log(task_key, f"    ↳ 2E interleave: assigned={pi}")
+                        except Exception as ie:
+                            _bg_log(task_key, f"    ↳ 2E interleave error: {ie}")
+                    if not loop or processed == 0:
+                        attempt = max_attempts
+                    break
+                except Exception as ex:
+                    if attempt < max_attempts and _is_transient_phase_failure(err=ex):
+                        _bg_log(task_key, f"↻ {phase_name}: transient error, retrying once ({ex})")
+                        continue
+                    _bg_log(task_key, f"❌ {phase_name}: {ex}")
+                    ok = False
+                    break
+            if not ok or not loop or processed == 0:
+                break
+        suffix = f" ({call_n} calls)" if call_n > 1 else ""
+        _bg_log(task_key, f"{'✅' if ok else '❌'} {phase_name}: {'OK' if ok else 'FAILED'} processed={grand}{suffix}")
+        if not ok:
+            _bg_log(task_key, f"🛑 Pipeline aborted at {phase_name}")
+            return {"product": product, "limit": limit, "phases": len(phases), "aborted_at": phase_name}
+    return {"product": product, "limit": limit, "phases": len(phases)}
 
 
 # ─────────────────────────────────────────────────────────
@@ -236,11 +360,51 @@ def get_cnx():
 # ─────────────────────────────────────────────────────────
 # Sidebar navigation
 # ─────────────────────────────────────────────────────────
+_PAGES = ["📊 Overview", "📦 Products", "📚 Knowledge Sources", "🚨 Emergent", "💎 Nuggets", "🧠 Prompts", "⚙️ Pipelines"]
+_PAGE_TO_QUERY = {
+    "📊 Overview": "overview",
+    "📦 Products": "products",
+    "📚 Knowledge Sources": "knowledge-sources",
+    "🚨 Emergent": "emergent",
+    "💎 Nuggets": "nuggets",
+    "🧠 Prompts": "prompts",
+    "⚙️ Pipelines": "pipelines",
+}
+_QUERY_TO_PAGE = {v: k for k, v in _PAGE_TO_QUERY.items()}
+
+try:
+    _qp_page = st.query_params.get("page")
+    if isinstance(_qp_page, list):
+        _qp_page = _qp_page[0] if _qp_page else None
+except Exception:
+    _qp_page = None
+
+_nav_target = st.session_state.pop("_nav_target", None)
+
+if _nav_target in _PAGES:
+    st.session_state["dashboard_page"] = _nav_target
+elif "dashboard_page" not in st.session_state or st.session_state["dashboard_page"] not in _PAGES:
+    if _qp_page in _QUERY_TO_PAGE:
+        st.session_state["dashboard_page"] = _QUERY_TO_PAGE[_qp_page]
+    else:
+        st.session_state["dashboard_page"] = _PAGES[0]
+
+if st.session_state["dashboard_page"] not in _PAGES:
+    st.session_state["dashboard_page"] = _PAGES[0]
+
 page = st.sidebar.radio(
     "Navigate",
-    ["📊 Overview", "📦 Products", "📚 Knowledge Sources", "🚨 Emergent", "💎 Nuggets", "⚙️ Pipelines"],
-    index=0,
+    _PAGES,
+    index=_PAGES.index(st.session_state["dashboard_page"]),
+    key="dashboard_page",
 )
+
+try:
+    _desired_qp = _PAGE_TO_QUERY.get(page, "overview")
+    if st.query_params.get("page") != _desired_qp:
+        st.query_params["page"] = _desired_qp
+except Exception:
+    pass
 
 
 # ═════════════════════════════════════════════════════════
@@ -1169,6 +1333,193 @@ elif page == "💎 Nuggets":
 
 
 # ═════════════════════════════════════════════════════════
+# PAGE: Prompts (per-product prompt customization)
+# ═════════════════════════════════════════════════════════
+elif page == "🧠 Prompts":
+    st.title("🧠 Per-Product Prompt Customization")
+    st.caption(
+        "Add product-specific guidance. GPT-5.4-nano will convert it into concise "
+        "addons that are appended to the system prompts for **Phase 1B, 4A, 4B, 4C, 4D** "
+        "only when that canonical product is processed. Run this BEFORE the pipeline."
+    )
+
+    cnx = get_cnx()
+
+    try:
+        from product_prompt_addons import (
+            PHASE_KEYS as _PHASE_KEYS,
+            PHASE_PURPOSE as _PHASE_PURPOSE,
+            ensure_table as _pp_ensure_table,
+            list_customizations as _pp_list,
+            get_customization as _pp_get,
+            save_customization as _pp_save,
+            delete_customization as _pp_delete,
+            generate_addons as _pp_generate,
+        )
+        _pp_ensure_table(cnx)
+    except Exception as e:
+        st.error(f"Prompt addons helper not available: {e}")
+        _PHASE_KEYS = ()
+        _PHASE_PURPOSE = {}
+        _pp_list = _pp_get = _pp_save = _pp_delete = _pp_generate = None
+
+    if _pp_list is not None:
+        # ── Summary table ─────────────────────────────────
+        st.subheader("Existing customizations")
+        try:
+            rows = _pp_list(cnx)
+            if rows:
+                df_pp = pd.DataFrame([
+                    {
+                        "Product": r["product_name"],
+                        "Description": "✓" if r.get("has_raw") else "—",
+                        "1B": "✓" if r.get("has_p1b") else "—",
+                        "4A": "✓" if r.get("has_p4a") else "—",
+                        "4B": "✓" if r.get("has_p4b") else "—",
+                        "4C": "✓" if r.get("has_p4c") else "—",
+                        "4D": "✓" if r.get("has_p4d") else "—",
+                        "Generated": r.get("generated_at"),
+                        "Updated": r.get("updated_at"),
+                        "Model": r.get("generated_model") or "—",
+                    }
+                    for r in rows
+                ])
+                st.dataframe(df_pp, use_container_width=True, hide_index=True)
+            else:
+                st.info("No customizations yet. Select a product below to create one.")
+        except Exception as e:
+            st.warning(f"Could not load customizations: {e}")
+
+        st.divider()
+
+        # ── Product selection ─────────────────────────────
+        try:
+            products = fetch_enrichment_product_names(cnx)
+        except Exception:
+            products = []
+
+        if not products:
+            st.info("No canonical enriched products yet. Run Phase 1A first or seed products.")
+        else:
+            sel_col, del_col = st.columns([3, 1])
+            with sel_col:
+                selected_product = st.selectbox(
+                    "Canonical enriched product",
+                    products,
+                    key="pp_product_select",
+                    help="Addons will apply ONLY when processing this product.",
+                )
+            with del_col:
+                if st.button("🗑️ Delete customization", key="pp_delete_btn", use_container_width=True):
+                    try:
+                        _pp_delete(cnx, selected_product)
+                        st.success(f"Deleted customization for **{selected_product}**.")
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f"Delete failed: {ex}")
+
+            existing = _pp_get(cnx, selected_product) or {}
+
+            # ── Raw description + Generate ────────────────
+            st.markdown("#### 1. Plain-English guidance")
+            raw_key = f"pp_raw_{selected_product}"
+            if raw_key not in st.session_state:
+                st.session_state[raw_key] = existing.get("raw_description") or ""
+
+            raw_text = st.text_area(
+                "Describe product-specific priorities, conventions, or coverage emphasis.",
+                key=raw_key,
+                height=200,
+                placeholder=(
+                    "Example:\n"
+                    "Virtual Network is shared across many Azure services. Categorize issues by "
+                    "operation type (CRUD, connectivity, migration, events). Topics should be "
+                    "components that live inside a VNet (private endpoint, ExpressRoute, "
+                    "peering, NSG, UDR). For topic wikis, also explain how each component "
+                    "integrates with the broader VNet architecture."
+                ),
+                max_chars=8000,
+            )
+
+            btn_cols = st.columns(3)
+            with btn_cols[0]:
+                save_raw = st.button("💾 Save description only", key="pp_save_raw_btn", use_container_width=True)
+            with btn_cols[1]:
+                gen_btn = st.button("✨ Generate addons (GPT-5.4-nano)", key="pp_generate_btn", type="primary", use_container_width=True)
+            with btn_cols[2]:
+                save_all = st.button("💾 Save all", key="pp_save_all_btn", use_container_width=True)
+
+            if save_raw:
+                try:
+                    _pp_save(cnx, selected_product, raw_description=raw_text or "")
+                    st.success("Description saved.")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Save failed: {ex}")
+
+            if gen_btn:
+                if not (raw_text or "").strip():
+                    st.error("Write a description first.")
+                else:
+                    with st.spinner("Calling GPT-5.4-nano…"):
+                        try:
+                            result = _pp_generate(selected_product, raw_text)
+                            addons = result.get("addons") or {}
+                            _pp_save(
+                                cnx,
+                                selected_product,
+                                raw_description=raw_text,
+                                addons=addons,
+                                generated_model=result.get("model"),
+                                generated=True,
+                            )
+                            st.success("Generated and saved. Review and edit below if needed.")
+                            st.rerun()
+                        except Exception as ex:
+                            st.error(f"Generation failed: {ex}")
+
+            # ── Per-phase editable addons ─────────────────
+            st.markdown("#### 2. Per-phase addons (editable)")
+            phase_labels = {
+                "phase1b": "Phase 1B — Catalog categorization",
+                "phase4a": "Phase 4A — Nugget mining",
+                "phase4b": "Phase 4B — Variant wiki (L3)",
+                "phase4c": "Phase 4C — Scenario wiki (L2)",
+                "phase4d": "Phase 4D — Topic wiki (L1)",
+            }
+
+            edited: Dict[str, str] = {}
+            for key in _PHASE_KEYS:
+                label = phase_labels.get(key, key)
+                purpose = _PHASE_PURPOSE.get(key, "")
+                with st.expander(f"**{label}**", expanded=False):
+                    st.caption(purpose)
+                    state_key = f"pp_{key}_{selected_product}"
+                    if state_key not in st.session_state:
+                        st.session_state[state_key] = existing.get(f"{key}_addon") or ""
+                    edited[key] = st.text_area(
+                        f"Addon for {label}",
+                        key=state_key,
+                        height=160,
+                        max_chars=2000,
+                        label_visibility="collapsed",
+                    )
+
+            if save_all:
+                try:
+                    _pp_save(
+                        cnx,
+                        selected_product,
+                        raw_description=raw_text or "",
+                        addons=edited,
+                    )
+                    st.success("All changes saved.")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Save failed: {ex}")
+
+
+# ═════════════════════════════════════════════════════════
 # PAGE: Pipelines
 # ═════════════════════════════════════════════════════════
 elif page == "⚙️ Pipelines":
@@ -1257,8 +1608,8 @@ elif page == "⚙️ Pipelines":
     # ── Batch Management ─────────────────────────────────────
     st.subheader("📦 Batch Management")
     st.caption(
-        "A batch scopes a set of enriched threads so phases 1B → 4A only process those rows. "
-        "Create a batch below, then use the batch ID in the Demo Run section."
+        "A batch scopes rows in `thread_enrichment`, so the product must be the canonical enriched product name "
+        "(for example `Monitor`, `DevOps`, `Virtual Network`). Creating a batch below will also start the scoped pipeline automatically."
     )
 
     with st.container(border=True):
@@ -1278,7 +1629,7 @@ elif page == "⚙️ Pipelines":
             batch_limit = st.number_input("Threads", min_value=1, max_value=10000, value=100, step=10, key="batch_limit")
 
         b_force = st.checkbox("Force (re-stamp already-batched rows)", key="batch_force", value=False)
-        if st.button("📦 Create Batch", key="batch_create_btn", type="primary"):
+        if st.button("📦 Create Batch + Run Pipeline", key="batch_create_btn", type="primary"):
             bp = str(batch_product or "").strip()
             bi = batch_id_input.strip()
             if not bp or not bi:
@@ -1286,7 +1637,23 @@ elif page == "⚙️ Pipelines":
             else:
                 try:
                     n = create_batch(get_cnx(), batch_id=bi, product=bp, limit=int(batch_limit), force=b_force)
-                    st.success(f"✅ Stamped **{n}** threads with batch_id=`{bi}` for product **{bp}**.")
+                    st.success(f"✅ Stamped **{n}** threads with batch_id=`{bi}` for canonical product **{bp}**.")
+                    if n > 0:
+                        if _is_bg_running("pipeline_run"):
+                            st.warning("A pipeline is already running. Batch was created but pipeline was not auto-started.")
+                        else:
+                            auto_demo_mode = bool(st.session_state.get("demo_mode", True))
+                            auto_limit = max(1, int(batch_limit))
+                            auto_phases = _build_demo_phases(bp, auto_limit, bi, demo_mode=auto_demo_mode)
+                            _bg_task_start("pipeline_run", _run_pipeline_worker, auto_phases, bp, auto_limit)
+                            st.session_state["_nav_target"] = "⚙️ Pipelines"
+                            st.session_state["_demo_product_target"] = bp
+                            st.session_state["_demo_batch_id_target"] = bi
+                            st.session_state["_demo_limit_target"] = auto_limit
+                            try:
+                                st.query_params["page"] = "pipelines"
+                            except Exception:
+                                pass
                     st.rerun()
                 except Exception as ex:
                     st.error(f"Failed: {ex}")
@@ -1295,7 +1662,7 @@ elif page == "⚙️ Pipelines":
         batches = list_batches(cnx)
         if batches:
             df_batches = pd.DataFrame(batches)
-            df_batches.columns = ["Batch ID", "Threads", "Products", "Pending 1B", "Pending 2E", "Pending 4A", "Oldest", "Newest"]
+            df_batches.columns = ["Batch ID", "Threads", "Product", "Product Count", "Pending 1B", "Pending 2E", "Pending 4A", "Oldest", "Newest"]
             st.dataframe(df_batches, use_container_width=True, hide_index=True)
         else:
             st.info("No batches created yet.")
@@ -1312,10 +1679,21 @@ elif page == "⚙️ Pipelines":
     )
 
     try:
-        all_products = list_products(cnx)
-        product_names = sorted([p["product_name"] for p in all_products]) if all_products else []
+        product_names = fetch_enrichment_product_names(cnx)
     except Exception:
         product_names = []
+
+    _demo_product_target = st.session_state.pop("_demo_product_target", None)
+    if _demo_product_target and _demo_product_target in product_names:
+        st.session_state["demo_product"] = _demo_product_target
+
+    _demo_batch_target = st.session_state.pop("_demo_batch_id_target", None)
+    if _demo_batch_target:
+        st.session_state["demo_batch_id"] = _demo_batch_target
+
+    _demo_limit_target = st.session_state.pop("_demo_limit_target", None)
+    if _demo_limit_target:
+        st.session_state["demo_limit"] = int(_demo_limit_target)
 
     if not product_names:
         st.info("No products registered. Add a product first.")
@@ -1350,73 +1728,7 @@ elif page == "⚙️ Pipelines":
                 ),
             )
 
-            _FUNC_BASE = "http://localhost:7071/api"
-            _b = f"&batch_id={demo_batch_id.strip()}" if demo_batch_id.strip() else ""
-
-            # Demo-mode threshold overrides
-            _p3_thresh  = "min_members=1&min_usefulness=0.3"          if demo_mode else "min_members=2&min_usefulness=0.6"
-            _p4b_thresh = "min_members=0&min_usefulness=0.0"          if demo_mode else "min_members=3&min_usefulness=0.4"
-            _p4c_thresh = "min_members=0&child_min_members=0"         if demo_mode else "min_members=6&child_min_members=3"
-            _p4d_thresh = "min_members=0&require_child_wiki=0"        if demo_mode else "min_members=1&require_child_wiki=1"
-
-            # Tuple: (display_name, url, loop_until_empty, per_call_timeout_secs)
-            _batch = min(int(demo_limit), 20)   # safe per-call limit for LLM-heavy phases
-
-            # 1B and 2E must interleave: after every 1B call, run 2E once so newly
-            # catalog-checked threads get leaf-assigned before the next 1B batch.
-            # We encode this as a special sentinel in the phase list.
-            _1b_url = f"{_FUNC_BASE}/phase1b_cluster?product={demo_product}&batch_size=10&max_batches=20{_b}"
-            _2e_url = f"{_FUNC_BASE}/phase2e_assign_leaf?batch_size=10&max_batches=20&product={demo_product}{_b}"
-
-            demo_phases = [
-                # ── Catalog build + leaf assignment (interleaved) ─────────────
-                ("Phase 1B – Cluster",       _1b_url, True,  600, _2e_url),
-                ("Phase 1C – Emergent cluster",
-                 f"{_FUNC_BASE}/phase1c_emergent_cluster?product={demo_product}&batch_size=10&limit=50{_b}",
-                 False, 120, None),
-                # Final 2E drain after 1B fully done
-                ("Phase 2E – Assign leaf (final drain)", _2e_url, True,  600, None),
-                ("Phase 2F – Emergent detect",
-                 f"{_FUNC_BASE}/phase2f_detect_emergent?batch_size=10&max_batches=20{_b}",
-                 False, 120, None),
-                # ── Count leaves BEFORE playbook phases ───────────────────────
-                ("Phase 2G – Count leaves",
-                 f"{_FUNC_BASE}/phase2g_count_leaves?product={demo_product}",
-                 False,  60, None),
-                # ── Nugget mining ─────────────────────────────────────────────
-                ("Phase 4A – Nuggets",
-                 f"{_FUNC_BASE}/phase4a_nugget_mining?limit={_batch}&product={demo_product}{_b}",
-                 True,  600, None),
-                # ── Playbook generation ───────────────────────────────────────
-                ("Phase 3 – Common playbooks",
-                 f"{_FUNC_BASE}/phase3_common?limit={_batch}&product={demo_product}&{_p3_thresh}",
-                 True,  600, None),
-                ("Phase 3 – Push to wiki",
-                 f"{_FUNC_BASE}/phase3_push?limit={demo_limit}",
-                 False, 120, None),
-                # ── Wiki population ───────────────────────────────────────────
-                # Second 2G refresh so late-arriving leaves get correct counts
-                ("Phase 2G – Count leaves (refresh)",
-                 f"{_FUNC_BASE}/phase2g_count_leaves?product={demo_product}",
-                 False,  60, None),
-                # Second Phase 3 pass catches leaves created since first pass
-                ("Phase 3 – Common playbooks (pass 2)",
-                 f"{_FUNC_BASE}/phase3_common?limit={_batch}&product={demo_product}&{_p3_thresh}",
-                 True,  600, None),
-                ("Phase 3 – Push to wiki (pass 2)",
-                 f"{_FUNC_BASE}/phase3_push?limit={demo_limit}",
-                 False, 120, None),
-                ("Phase 4B – Variants wiki",
-                 f"{_FUNC_BASE}/phase4b_populate_variants?limit={_batch}&product={demo_product}&{_p4b_thresh}",
-                 True,  900, None),
-                ("Phase 4C – Scenarios wiki",
-                 f"{_FUNC_BASE}/phase4c_populate_scenarios?limit={_batch}&product={demo_product}&{_p4c_thresh}&model=gpt52",
-                 True,  900, None),
-                ("Phase 4D – Topics wiki",
-                 f"{_FUNC_BASE}/phase4d_populate_topics?limit={_batch}&product={demo_product}&{_p4d_thresh}",
-                 True,  600, None),
-            ]
-            # Tuple: (name, url, loop_until_empty, per_call_timeout_secs, interleave_url_or_None)
+            demo_phases = _build_demo_phases(demo_product, int(demo_limit), demo_batch_id, demo_mode=demo_mode)
 
             if _bg_task_ui("pipeline_run", f"Pipeline – {demo_product}"):
                 pass  # meta-refresh handles polling
@@ -1424,45 +1736,7 @@ elif page == "⚙️ Pipelines":
                 if st.button("▶️ Run All Phases", key="demo_run",
                              use_container_width=True,
                              disabled=_is_bg_running("pipeline_run")):
-                    import requests as _req
-
-                    def _run_pipeline(phases, product, limit):
-                        import requests as _rq
-                        for phase_name, url, loop, timeout, interleave_url in phases:
-                            grand, call_n, ok = 0, 0, True
-                            while True:
-                                call_n += 1
-                                try:
-                                    r = _rq.post(url, timeout=timeout)
-                                    body = r.json() if "json" in r.headers.get("content-type", "") else {}
-                                    if r.status_code != 200:
-                                        _bg_log("pipeline_run", f"⚠️ {phase_name}: HTTP {r.status_code}")
-                                        ok = False; break
-                                    processed = int(body.get("processed", body.get("ingested", 0)) or 0)
-                                    grand += processed
-                                    _bg_log("pipeline_run", f"  {phase_name} call {call_n}: +{processed} (total {grand})")
-                                    # After each productive 1B call, fire a 2E interleave call
-                                    if interleave_url and processed > 0:
-                                        try:
-                                            ri = _rq.post(interleave_url, timeout=timeout)
-                                            bi = ri.json() if "json" in ri.headers.get("content-type", "") else {}
-                                            pi = int(bi.get("processed", 0) or 0)
-                                            _bg_log("pipeline_run", f"    ↳ 2E interleave: assigned={pi}")
-                                        except Exception as ie:
-                                            _bg_log("pipeline_run", f"    ↳ 2E interleave error: {ie}")
-                                    if not loop or processed == 0:
-                                        break
-                                except Exception as ex:
-                                    _bg_log("pipeline_run", f"❌ {phase_name}: {ex}")
-                                    ok = False; break
-                            suffix = f" ({call_n} calls)" if call_n > 1 else ""
-                            _bg_log("pipeline_run", f"{'✅' if ok else '❌'} {phase_name}: {'OK' if ok else 'FAILED'} processed={grand}{suffix}")
-                            if not ok:
-                                _bg_log("pipeline_run", f"🛑 Pipeline aborted at {phase_name}")
-                                return {"product": product, "limit": limit, "phases": len(phases), "aborted_at": phase_name}
-                        return {"product": product, "limit": limit, "phases": len(phases)}
-
-                    _bg_task_start("pipeline_run", _run_pipeline, demo_phases, demo_product, demo_limit)
+                    _bg_task_start("pipeline_run", _run_pipeline_worker, demo_phases, demo_product, demo_limit)
                     st.rerun()
 
             # ── Force Reprocess Batch ─────────────────────────────────────────

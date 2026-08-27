@@ -53,7 +53,7 @@ def _ensure_max_usefulness_column(cnx: pyodbc.Connection) -> bool:
     return True
 
 
-def recompute_leaf_counts_and_usefulness(cnx: pyodbc.Connection) -> None:
+def recompute_leaf_counts_and_usefulness(cnx: pyodbc.Connection, product: str = "") -> None:
     """
     Recompute member_count and max_solution_usefulness on all issue_cluster levels.
 
@@ -69,15 +69,25 @@ def recompute_leaf_counts_and_usefulness(cnx: pyodbc.Connection) -> None:
       then rolled up to parents as MAX(child.max_solution_usefulness).
     """
     cur = cnx.cursor()
+    product = (product or "").strip()
+    prod_join_filter = "AND ic.product = ?" if product else ""
+    prod_target_filter = "AND ic.product = ?" if product else ""
+    prod_child_filter_l4 = "AND l4.product = ?" if product else ""
+    prod_child_filter_l3 = "AND l3.product = ?" if product else ""
+    prod_child_filter_l2 = "AND l2.product = ?" if product else ""
 
     # 1) L4 leaf counts + max usefulness
+    leaf_args = []
+    if product:
+        leaf_args.extend([product, product])
     cur.execute(
-        """
+        f"""
         ;WITH leaf_threads AS (
             SELECT te.thread_id, ic.cluster_id AS cid, te.solution_usefulness
             FROM dbo.thread_enrichment te
             JOIN dbo.issue_cluster ic
               ON ic.cluster_level = 4 AND ic.is_active = 1
+             {prod_join_filter}
              AND (
                    te.ResolutionLeafClusterID = ic.cluster_id
                 OR (te.product = ic.product
@@ -101,18 +111,24 @@ def recompute_leaf_counts_and_usefulness(cnx: pyodbc.Connection) -> None:
             ic.max_solution_usefulness = ls.max_usefulness
         FROM dbo.issue_cluster ic
         LEFT JOIN leaf_stats ls ON ls.cid = ic.cluster_id
-        WHERE ic.is_active = 1 AND ic.cluster_level = 4;
-        """
+        WHERE ic.is_active = 1 AND ic.cluster_level = 4
+          {prod_target_filter};
+        """,
+        *leaf_args,
     )
 
     # 2) L3 variant counts
+    variant_args = []
+    if product:
+        variant_args.extend([product, product, product])
     cur.execute(
-        """
+        f"""
         ;WITH variant_threads AS (
             SELECT te.thread_id, ic.cluster_id AS cid, te.solution_usefulness
             FROM dbo.thread_enrichment te
             JOIN dbo.issue_cluster ic
               ON ic.cluster_level = 3 AND ic.is_active = 1
+             {prod_join_filter}
              AND (
                    te.VariantClusterID = ic.cluster_id
                 OR (te.product = ic.product
@@ -136,6 +152,7 @@ def recompute_leaf_counts_and_usefulness(cnx: pyodbc.Connection) -> None:
                 MAX(l4.max_solution_usefulness) AS child_usefulness
             FROM dbo.issue_cluster l4
             WHERE l4.is_active = 1 AND l4.cluster_level = 4
+              {prod_child_filter_l4}
               AND l4.max_solution_usefulness IS NOT NULL
             GROUP BY l4.parent_cluster_id
         )
@@ -148,18 +165,24 @@ def recompute_leaf_counts_and_usefulness(cnx: pyodbc.Connection) -> None:
         FROM dbo.issue_cluster ic
         LEFT JOIN variant_stats vs ON vs.cid = ic.cluster_id
         LEFT JOIN child_max cm ON cm.cid = ic.cluster_id
-        WHERE ic.is_active = 1 AND ic.cluster_level = 3;
-        """
+        WHERE ic.is_active = 1 AND ic.cluster_level = 3
+          {prod_target_filter};
+        """,
+        *variant_args,
     )
 
     # 3) L2 scenario counts
+    scenario_args = []
+    if product:
+        scenario_args.extend([product, product, product])
     cur.execute(
-        """
+        f"""
         ;WITH scenario_threads AS (
             SELECT te.thread_id, ic.cluster_id AS cid, te.solution_usefulness
             FROM dbo.thread_enrichment te
             JOIN dbo.issue_cluster ic
               ON ic.cluster_level = 2 AND ic.is_active = 1
+             {prod_join_filter}
              AND (
                    te.ScenarioClusterID = ic.cluster_id
                 OR (te.product = ic.product
@@ -183,6 +206,7 @@ def recompute_leaf_counts_and_usefulness(cnx: pyodbc.Connection) -> None:
                 MAX(l3.max_solution_usefulness) AS child_usefulness
             FROM dbo.issue_cluster l3
             WHERE l3.is_active = 1 AND l3.cluster_level = 3
+              {prod_child_filter_l3}
               AND l3.max_solution_usefulness IS NOT NULL
             GROUP BY l3.parent_cluster_id
         )
@@ -195,18 +219,24 @@ def recompute_leaf_counts_and_usefulness(cnx: pyodbc.Connection) -> None:
         FROM dbo.issue_cluster ic
         LEFT JOIN scenario_stats ss ON ss.cid = ic.cluster_id
         LEFT JOIN child_max cm ON cm.cid = ic.cluster_id
-        WHERE ic.is_active = 1 AND ic.cluster_level = 2;
-        """
+        WHERE ic.is_active = 1 AND ic.cluster_level = 2
+          {prod_target_filter};
+        """,
+        *scenario_args,
     )
 
     # 4) L1 topic counts
+    topic_args = []
+    if product:
+        topic_args.extend([product, product, product])
     cur.execute(
-        """
+        f"""
         ;WITH topic_threads AS (
             SELECT te.thread_id, ic.cluster_id AS cid, te.solution_usefulness
             FROM dbo.thread_enrichment te
             JOIN dbo.issue_cluster ic
               ON ic.cluster_level = 1 AND ic.is_active = 1
+             {prod_join_filter}
              AND (
                    te.TopicClusterID = ic.cluster_id
                 OR (te.product = ic.product
@@ -230,6 +260,7 @@ def recompute_leaf_counts_and_usefulness(cnx: pyodbc.Connection) -> None:
                 MAX(l2.max_solution_usefulness) AS child_usefulness
             FROM dbo.issue_cluster l2
             WHERE l2.is_active = 1 AND l2.cluster_level = 2
+              {prod_child_filter_l2}
               AND l2.max_solution_usefulness IS NOT NULL
             GROUP BY l2.parent_cluster_id
         )
@@ -242,8 +273,10 @@ def recompute_leaf_counts_and_usefulness(cnx: pyodbc.Connection) -> None:
         FROM dbo.issue_cluster ic
         LEFT JOIN topic_stats ts ON ts.cid = ic.cluster_id
         LEFT JOIN child_max cm ON cm.cid = ic.cluster_id
-        WHERE ic.is_active = 1 AND ic.cluster_level = 1;
-        """
+        WHERE ic.is_active = 1 AND ic.cluster_level = 1
+          {prod_target_filter};
+        """,
+        *topic_args,
     )
 
 
@@ -263,15 +296,17 @@ def run_phase2g_count_leaves(req: func.HttpRequest) -> func.HttpResponse:
           * All levels: max_solution_usefulness = MAX(direct threads, child max)
     """
     try:
+        product = (req.params.get("product") or "").strip()
         with sql_connect() as cnx:
             created = _ensure_max_usefulness_column(cnx)
-            recompute_leaf_counts_and_usefulness(cnx)
+            recompute_leaf_counts_and_usefulness(cnx, product=product)
             cnx.commit()
 
         return func.HttpResponse(
             json.dumps(
                 {
                     "status": "ok",
+                    "product": product or None,
                     "column_created": bool(created),
                     "column_name": "dbo.issue_cluster.max_solution_usefulness",
                     "column_type": "DECIMAL(4,3)",

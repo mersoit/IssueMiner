@@ -1,14 +1,37 @@
 import os
 import json
+import logging
+import time
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
 
 import pyodbc
 
+# A serverless database that has auto-paused refuses logins until it resumes, which takes
+# roughly a minute. Treat that (and transient network blips) as retryable rather than fatal.
+_CONNECT_RETRIES = int(os.getenv("SQL_CONNECT_RETRIES", "5"))
+_CONNECT_BACKOFF = float(os.getenv("SQL_CONNECT_BACKOFF", "15"))
+_RESUME_SQLSTATES = ("08001", "08S01", "40613", "HYT00", "HY000")
+
 
 def sql_connect() -> pyodbc.Connection:
     cs = os.environ["SQL_CONNECTION_STRING"]
-    return pyodbc.connect(cs)
+    last: Optional[Exception] = None
+    for attempt in range(1, _CONNECT_RETRIES + 1):
+        try:
+            return pyodbc.connect(cs)
+        except pyodbc.Error as exc:
+            last = exc
+            state = exc.args[0] if exc.args else ""
+            if state not in _RESUME_SQLSTATES or attempt == _CONNECT_RETRIES:
+                raise
+            wait = _CONNECT_BACKOFF * attempt
+            logging.warning(
+                "[sql] connect failed (%s) attempt %d/%d — database may be resuming; retrying in %.0fs",
+                state, attempt, _CONNECT_RETRIES, wait,
+            )
+            time.sleep(wait)
+    raise last  # type: ignore[misc]
 
 
 def get_watermark(cnx: pyodbc.Connection, pipeline_name: str) -> Tuple[dt.datetime, int]:

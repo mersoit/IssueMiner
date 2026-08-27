@@ -22,6 +22,10 @@ from aoai_helpers import (
 # Limits SQL statement size + lock footprint
 _P1B_INSERT_BATCH = int(os.getenv("P1B_INSERT_BATCH", "200"))
 _P1B_KEEP_IDS_MIN_FRACTION = float(os.getenv("P1B_KEEP_IDS_MIN_FRACTION", "0.85"))
+_P1B_PROPOSE_MODEL = (os.getenv("P1B_PROPOSE_MODEL", "nano") or "nano").strip().lower()
+_P1B_PROPOSE_FALLBACK_MODEL = (os.getenv("P1B_PROPOSE_FALLBACK_MODEL", "mini") or "").strip().lower()
+_P1B_PROPOSE_SIG_MAX_CHARS = int(os.getenv("P1B_PROPOSE_SIG_MAX_CHARS", "400"))
+_P1B_PROPOSE_RES_SIG_MAX_CHARS = int(os.getenv("P1B_PROPOSE_RES_SIG_MAX_CHARS", "400"))
 
 _P1B_LOG_FULL_PROMPT = (os.getenv("P1B_LOG_FULL_PROMPT", "0") == "1")
 _P1B_LOG_MAX_PROMPT_CHARS = int(os.getenv("P1B_LOG_MAX_PROMPT_CHARS", "500"))
@@ -43,6 +47,13 @@ def _safe_json_preview(obj: Any, max_chars: int) -> str:
     except Exception:
         s = str(obj)
     return _truncate(s, max_chars)
+
+
+def _get_phase1b_propose_runtime(model_name: str) -> Tuple[AzureOpenAI, str, str]:
+    model_name = (model_name or "nano").strip().lower()
+    if model_name == "mini":
+        return make_mini_client(), get_mini_deployment(), "mini"
+    return make_nano_client(), get_nano_deployment(), "nano"
 
 
 def _log_nano_call(
@@ -761,12 +772,20 @@ def call_nano_catalog_propose(
         "- L4: product, level=4, topic_key, scenario_key, variant_key, leaf_key, signature_text, resolution_signature_text\n"
     )
 
+    try:
+        from product_prompt_addons import append_product_addon as _append_addon
+        _products_in_batch = {str(t.get("product") or "").strip() for t in threads if (t.get("product") or "").strip()}
+        for _p in _products_in_batch:
+            system_prompt = _append_addon(system_prompt, _p, "phase1b")
+    except Exception:
+        pass
+
     slim_threads = [
         {
             "thread_id": t.get("thread_id"),
             "product": t.get("product"),
-            "signature_text": (t.get("signature_text") or "")[:700],
-            "resolution_signature_text": (t.get("resolution_signature_text") or "")[:700],
+            "signature_text": (t.get("signature_text") or "")[:_P1B_PROPOSE_SIG_MAX_CHARS],
+            "resolution_signature_text": (t.get("resolution_signature_text") or "")[:_P1B_PROPOSE_RES_SIG_MAX_CHARS],
             "hints": {
                 "topic_cluster_key": t.get("topic_cluster_key"),
                 "scenario_cluster_key": t.get("scenario_cluster_key"),
@@ -794,29 +813,42 @@ def call_nano_catalog_propose(
         user_payload=user_payload,
     )
 
-    # Use Mini for propose (better key quality + multi-constraint reasoning)
-    mini_client = make_mini_client()
-    mini_deployment = get_mini_deployment()
-
     user_content = json.dumps(user_payload, ensure_ascii=False)
-    resp = call_aoai_with_retry(
-        mini_client,
-        model=mini_deployment,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-        response_format={"type": "json_object"},
-        estimated_prompt_tokens=estimate_tokens(system_prompt) + estimate_tokens(user_content),
-        rate_limiter=get_rate_limiter("mini"),
-        caller_tag="phase1b_propose",
-    )
+    propose_models: List[str] = [_P1B_PROPOSE_MODEL or "nano"]
+    if _P1B_PROPOSE_FALLBACK_MODEL and _P1B_PROPOSE_FALLBACK_MODEL not in propose_models:
+        propose_models.append(_P1B_PROPOSE_FALLBACK_MODEL)
 
-    resp_text = resp.choices[0].message.content or ""
-    parsed = json.loads(resp_text)
+    last_error: Optional[Exception] = None
+    for model_name in propose_models:
+        client, deployment, limiter_name = _get_phase1b_propose_runtime(model_name)
+        try:
+            resp = call_aoai_with_retry(
+                client,
+                model=deployment,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                response_format={"type": "json_object"},
+                estimated_prompt_tokens=estimate_tokens(system_prompt) + estimate_tokens(user_content),
+                rate_limiter=get_rate_limiter(limiter_name),
+                caller_tag=f"phase1b_propose_{model_name}",
+            )
 
-    _log_nano_response("propose", resp_text, parsed)
-    return parsed
+            resp_text = resp.choices[0].message.content or ""
+            parsed = json.loads(resp_text)
+            if model_name != propose_models[0]:
+                logging.warning("phase1b propose fallback succeeded with model=%s", model_name)
+            _log_nano_response("propose", resp_text, parsed)
+            return parsed
+        except Exception as e:
+            last_error = e
+            if model_name != propose_models[-1]:
+                logging.warning("phase1b propose failed with model=%s; trying fallback. Error: %s", model_name, str(e)[:300])
+            else:
+                logging.error("phase1b propose failed with final model=%s. Error: %s", model_name, str(e)[:300])
+
+    raise last_error or RuntimeError("phase1b propose failed with no model attempted")
 
 
 def call_nano_catalog_refine(
@@ -1080,6 +1112,7 @@ def bulk_get_or_create_issue_clusters(
                     AND ic.product = r.prod
                     AND ic.cluster_level = r.lvl
                     AND ic.cluster_key = r.k
+                    AND (r.lvl = 1 OR ic.parent_cluster_id = r.parent_id)
               );
         END TRY
         BEGIN CATCH
@@ -1109,6 +1142,7 @@ def bulk_get_or_create_issue_clusters(
          AND ic.product = r.prod
          AND ic.cluster_level = r.lvl
          AND ic.cluster_key = r.k
+         AND (r.lvl = 1 OR ic.parent_cluster_id = r.parent_id)
         WHERE (r.lvl = 1 OR r.parent_id IS NOT NULL)
           AND (ic.created_by_phase = 'phase1b_catalog' OR ic.created_by_phase IS NULL);
 
@@ -1130,6 +1164,7 @@ def bulk_get_or_create_issue_clusters(
          AND ic.product = r.prod
          AND ic.cluster_level = r.lvl
          AND ic.cluster_key = r.k
+         AND (r.lvl = 1 OR ic.parent_cluster_id = r.parent_id)
         WHERE (r.lvl = 1 OR r.parent_id IS NOT NULL)
         ORDER BY r.rownum ASC;
         """,
@@ -1545,7 +1580,6 @@ def run_phase1b_cluster(req: func.HttpRequest) -> func.HttpResponse:
             # If a product param was provided, lock to that product only.
             chosen_product: Optional[str] = product_param
             seen_products: Set[str] = set()
-            catalog_slice_start = 0
 
             batch_aoai_errors = 0
 
@@ -1563,7 +1597,6 @@ def run_phase1b_cluster(req: func.HttpRequest) -> func.HttpResponse:
                         break
                     cursor_ingested_at = None
                     cursor_thread_id = None
-                    catalog_slice_start = 0
                     logging.warning("phase1b chosen_product=%s", chosen_product)
 
                 rows = fetch_unclustered_enrichments(
@@ -1605,7 +1638,6 @@ def run_phase1b_cluster(req: func.HttpRequest) -> func.HttpResponse:
 
                     for batch_product, batch_rows in rows_by_product.items():
                         default_prod = batch_product
-                        catalog_slice_start = 0
 
                         candidates: Dict[str, Dict[str, Any]] = {}
 
@@ -1620,12 +1652,14 @@ def run_phase1b_cluster(req: func.HttpRequest) -> func.HttpResponse:
                         prev_candidate_keys: Optional[set] = None
 
                         for slice_index in range(1, effective_slices + 1):
-                            # Window and slim directly over the product-scoped catalog
-                            window = _catalog_window(product_catalog, start=catalog_slice_start, size=slice_limit)
-                            slim_slice = _build_slim_catalog_slice(product_catalog, window)
+                            # Offset derives from slice_index; a cursor advanced after the window
+                            # was built made slice 2 re-show slice 1's rows.
+                            slice_start = (slice_index - 1) * slice_limit
+                            if slice_index > 1 and slice_start >= len(product_catalog):
+                                break
 
-                            if slice_index > 1 and len(product_catalog) > slice_limit:
-                                catalog_slice_start = (catalog_slice_start + slice_limit) % max(1, len(product_catalog))
+                            window = _catalog_window(product_catalog, start=slice_start, size=slice_limit)
+                            slim_slice = _build_slim_catalog_slice(product_catalog, window)
 
                             if slice_index == 1:
                                 out = call_nano_catalog_propose(

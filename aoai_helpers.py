@@ -240,6 +240,14 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return False
 
 
+_NO_TEMPERATURE_MODELS: set = set()
+
+
+def _is_unsupported_temperature_error(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return "temperature" in s and ("does not support" in s or "unsupported_value" in s)
+
+
 def _is_transient_error(exc: Exception) -> bool:
     exc_str = str(exc).lower()
     if any(tok in exc_str for tok in ("timeout", "timed out", "connection", "502", "503", "504")):
@@ -329,6 +337,9 @@ def call_aoai_with_retry(
         estimated_prompt_tokens = max(1, math.ceil(total_chars / _CHARS_PER_TOKEN))
 
     last_exc: Optional[Exception] = None
+    # gpt-5.x only accepts the default temperature; drop it and retry rather than fail the batch.
+    # Remembered per model so this costs one wasted round-trip per process, not per call.
+    drop_temperature = model in _NO_TEMPERATURE_MODELS
 
     for attempt in range(1, max_retries + 1):
         rate_limiter.wait_if_needed(estimated_prompt_tokens)
@@ -339,13 +350,21 @@ def call_aoai_with_retry(
                 kwargs["response_format"] = response_format
             if max_completion_tokens is not None:
                 kwargs["max_completion_tokens"] = max_completion_tokens
-            if temperature is not None:
+            if temperature is not None and not drop_temperature:
                 kwargs["temperature"] = temperature
 
             return client.chat.completions.create(**kwargs)
 
         except Exception as exc:
             last_exc = exc
+            if not drop_temperature and _is_unsupported_temperature_error(exc):
+                drop_temperature = True
+                _NO_TEMPERATURE_MODELS.add(model)
+                logging.warning(
+                    "[%s] model %s rejected temperature=%s; retrying without it.",
+                    caller_tag or "aoai", model, temperature,
+                )
+                continue
             is_rate = _is_rate_limit_error(exc)
             is_transient = _is_transient_error(exc)
 
@@ -390,7 +409,7 @@ def call_aoai_with_retry(
                 kwargs_final["response_format"] = response_format
             if max_completion_tokens is not None:
                 kwargs_final["max_completion_tokens"] = max_completion_tokens
-            if temperature is not None:
+            if temperature is not None and not drop_temperature:
                 kwargs_final["temperature"] = temperature
             return client.chat.completions.create(**kwargs_final)
         except Exception as final_exc:
@@ -561,7 +580,7 @@ def make_mini_client() -> AzureOpenAI:
                 ),
                 timeout=float(os.getenv(
                     "AOAI_TIMEOUT_SECONDS_MINI",
-                    os.getenv("AOAI_TIMEOUT_SECONDS", "120"),
+                    os.getenv("AOAI_TIMEOUT_SECONDS", "300"),
                 )),
                 max_retries=0,
             )
@@ -572,6 +591,42 @@ def get_mini_deployment() -> str:
     dep = (os.environ.get("AOAI_DEPLOYMENT_MINI") or "").strip()
     if not dep:
         raise RuntimeError("Missing AOAI_DEPLOYMENT_MINI env var.")
+    return dep
+
+
+# ─────────────────────────────────────────────────────────
+# Image generation client (gpt-image-2)
+# ─────────────────────────────────────────────────────────
+_IMAGE_CLIENT: Optional[AzureOpenAI] = None
+
+
+def make_image_client() -> AzureOpenAI:
+    """Return (or create) the singleton AzureOpenAI client for image generation."""
+    global _IMAGE_CLIENT
+    if _IMAGE_CLIENT is not None:
+        return _IMAGE_CLIENT
+    with _client_lock:
+        if _IMAGE_CLIENT is None:
+            endpoint = (os.environ.get("AOAI_ENDPOINT_IMAGE") or "").strip()
+            key = (os.environ.get("AOAI_API_KEY_IMAGE") or "").strip()
+            if not endpoint or not key:
+                raise RuntimeError(
+                    "Missing AOAI_ENDPOINT_IMAGE / AOAI_API_KEY_IMAGE env vars."
+                )
+            _IMAGE_CLIENT = AzureOpenAI(
+                azure_endpoint=endpoint.rstrip("/"),
+                api_key=key,
+                api_version=os.getenv("AOAI_API_VERSION_IMAGE", "2024-10-01-preview"),
+                timeout=float(os.getenv("AOAI_TIMEOUT_SECONDS_IMAGE", "180")),
+                max_retries=0,
+            )
+    return _IMAGE_CLIENT
+
+
+def get_image_deployment() -> str:
+    dep = (os.environ.get("AOAI_DEPLOYMENT_IMAGE") or "").strip()
+    if not dep:
+        raise RuntimeError("Missing AOAI_DEPLOYMENT_IMAGE env var.")
     return dep
 
 
@@ -754,9 +809,26 @@ _DEFAULT_ANTHROPIC_TPM = int(os.getenv("AOAI_ANTHROPIC_TPM_LIMIT", "900000"))
 def sql_connect(autocommit: bool = False) -> pyodbc.Connection:
     cs = os.environ["SQL_CONNECTION_STRING"]
     timeout = int(os.getenv("SQL_CONNECT_TIMEOUT", "30"))
-    cnx = pyodbc.connect(cs, timeout=timeout)
-    cnx.autocommit = autocommit
-    return cnx
+    # A serverless database that has auto-paused rejects logins until it resumes (~1 min).
+    retries = int(os.getenv("SQL_CONNECT_RETRIES", "5"))
+    backoff = float(os.getenv("SQL_CONNECT_BACKOFF", "15"))
+    resume_states = ("08001", "08S01", "40613", "HYT00", "HY000")
+    for attempt in range(1, retries + 1):
+        try:
+            cnx = pyodbc.connect(cs, timeout=timeout)
+            cnx.autocommit = autocommit
+            return cnx
+        except pyodbc.Error as exc:
+            state = exc.args[0] if exc.args else ""
+            if state not in resume_states or attempt == retries:
+                raise
+            wait = backoff * attempt
+            logging.warning(
+                "[sql] connect failed (%s) attempt %d/%d — database may be resuming; retrying in %.0fs",
+                state, attempt, retries, wait,
+            )
+            time.sleep(wait)
+    raise RuntimeError("unreachable")
 
 
 # ─────────────────────────────────────────────────────────

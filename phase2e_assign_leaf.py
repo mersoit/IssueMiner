@@ -53,7 +53,11 @@ _AOAI_MAX_CONCURRENCY = int(os.getenv("AOAI_MAX_CONCURRENCY", "4"))
 _aoai_sema = threading.BoundedSemaphore(_AOAI_MAX_CONCURRENCY)
 
 # Fan-out guardrails: staged assignment can explode into many calls
-_P2E_MAX_TOPIC_GROUPS = int(os.getenv("P2E_MAX_TOPIC_GROUPS", "4"))
+# Above this many distinct topics in one batch, 2E falls back to a single combined "full" call.
+# That fallback also skips orphan autocreate, and because it ships the whole unfiltered catalog
+# it measured both worse and more expensive than the staged path (17% vs 83% assigned,
+# 228k vs 104k prompt tokens), so keep the threshold high enough that staging is the norm.
+_P2E_MAX_TOPIC_GROUPS = int(os.getenv("P2E_MAX_TOPIC_GROUPS", "24"))
 _P2E_MAX_SCENARIO_GROUPS = int(os.getenv("P2E_MAX_SCENARIO_GROUPS", "6"))
 
 # Default stage payload caps (per-call).
@@ -70,7 +74,34 @@ _P2E_ORPHAN_AUTOCREATE_ENABLED = (os.getenv("P2E_ORPHAN_AUTOCREATE_ENABLED", "1"
 _P2E_ORPHAN_USEFULNESS_MIN = float(os.getenv("P2E_ORPHAN_USEFULNESS_MIN", "0.4"))
 _P2E_ORPHAN_MAX_THREADS_PER_BATCH = int(os.getenv("P2E_ORPHAN_MAX_THREADS_PER_BATCH", "12"))
 _P2E_ORPHAN_CREATED_BY_PHASE = os.getenv("P2E_ORPHAN_CREATED_BY_PHASE", "phase2e_orphan_autocreate")
+# The assigner reports a missing node at whichever level it first fails, so autocreate has to
+# cover the whole chain — restricting it to leaf-only statuses left it effectively dead.
+_P2E_ORPHAN_TRIGGER_STATUSES = {
+    s.strip()
+    for s in os.getenv(
+        "P2E_ORPHAN_TRIGGER_STATUSES",
+        "no_leaf_match,missing_leaf,missing_variant,missing_scenario",
+    ).split(",")
+    if s.strip()
+}
 _P2E_ORPHAN_INSERT_BATCH = int(os.getenv("P2E_ORPHAN_INSERT_BATCH", "200"))
+
+# Retry budget before a thread that cannot be placed is given up on.
+_P2E_MAX_ASSIGN_ATTEMPTS = int(os.getenv("P2E_MAX_ASSIGN_ATTEMPTS", "3"))
+
+# Outcomes meaning the thread was never placed on the taxonomy at all.
+# A thread that reports a missing node must be retried, not completed: orphan autocreate runs
+# between attempts and creates the node it was missing. Completing them stamps
+# AssignmentCompletedUtc with a NULL leaf, which hides the thread from every later phase.
+_P2E_RETRYABLE_STATUSES = {
+    s.strip()
+    for s in os.getenv(
+        "P2E_RETRYABLE_STATUSES",
+        "bad_assignment,missing_topic,no_catalog_for_product,"
+        "missing_scenario,missing_variant,missing_leaf,no_leaf_match",
+    ).split(",")
+    if s.strip()
+}
 
 
 # ---------------------------------------------------------
@@ -300,6 +331,80 @@ def release_assignment_claim(cnx: pyodbc.Connection, thread_ids: List[str]) -> N
         """,
         *[str(t) for t in thread_ids],
     )
+
+
+def ensure_assignment_attempts_column(cnx: pyodbc.Connection) -> None:
+    cur = cnx.cursor()
+    cur.execute(
+        """
+        IF COL_LENGTH('dbo.thread_enrichment', 'AssignmentAttempts') IS NULL
+            ALTER TABLE dbo.thread_enrichment
+            ADD AssignmentAttempts INT NOT NULL
+                CONSTRAINT DF_thread_enrichment_AssignmentAttempts DEFAULT (0);
+        """
+    )
+
+
+def record_failed_assignment(
+    cnx: pyodbc.Connection,
+    thread_ids: List[str],
+    max_attempts: int = _P2E_MAX_ASSIGN_ATTEMPTS,
+) -> None:
+    """Release the claim so the thread is retried, or give up once the retry budget is spent."""
+    if not thread_ids:
+        return
+    cur = cnx.cursor()
+    placeholders = ",".join("?" for _ in thread_ids)
+    cur.execute(
+        f"""
+        UPDATE dbo.thread_enrichment
+        SET AssignmentAttempts = ISNULL(AssignmentAttempts, 0) + 1,
+            AssignmentStartedUtc = CASE
+                WHEN ISNULL(AssignmentAttempts, 0) + 1 >= ? THEN AssignmentStartedUtc
+                ELSE NULL END,
+            AssignmentCompletedUtc = CASE
+                WHEN ISNULL(AssignmentAttempts, 0) + 1 >= ? THEN SYSUTCDATETIME()
+                ELSE NULL END
+        WHERE thread_id IN ({placeholders})
+          AND AssignmentCompletedUtc IS NULL
+        """,
+        int(max_attempts),
+        int(max_attempts),
+        *[str(t) for t in thread_ids],
+    )
+
+
+def split_assignment_outcomes(
+    threads: List[Dict[str, Any]],
+    results: List[Dict[str, Any]],
+) -> Tuple[List[str], List[str]]:
+    """Separate threads that landed on the taxonomy from those that did not."""
+    status_by_tid = {str(r.get("thread_id") or ""): str(r.get("status") or "") for r in results}
+    done: List[str] = []
+    failed: List[str] = []
+    for t in threads:
+        tid = str(t.get("thread_id") or "")
+        if not tid:
+            continue
+        status = status_by_tid.get(tid)
+        if status is None or status in _P2E_RETRYABLE_STATUSES:
+            failed.append(tid)
+        else:
+            done.append(tid)
+    return done, failed
+
+
+def finalize_assignment_batch(
+    cnx: pyodbc.Connection,
+    threads: List[Dict[str, Any]],
+    results: List[Dict[str, Any]],
+) -> Tuple[int, int]:
+    done, failed = split_assignment_outcomes(threads, results)
+    mark_assignment_completed(cnx, done)
+    record_failed_assignment(cnx, failed)
+    if failed:
+        logging.warning("[2E] unplaced_threads=%d retried_or_exhausted", len(failed))
+    return len(done), len(failed)
 
 
 # ---------------------------------------------------------
@@ -600,7 +705,7 @@ def _filter_catalog_for_scenario_stage(catalog_payload: Dict[str, Any], topic_ke
     return {"topics": [{"key": topic_key, "parent_key": None, "sig": "", "res_sig": ""}], "scenarios": scenarios[:max_scenarios], "variants": [], "leaves": [], "scenario_by_topic": scenario_by_topic, "variant_by_scenario": {}, "leaf_by_variant": {}}
 
 
-def _filter_catalog_for_variant_leaf_stage(catalog_payload: Dict[str, Any], scenario_key: str, max_variants: int, max_leaves: int) -> Dict[str, Any]:
+def _filter_catalog_for_variant_leaf_stage(catalog_payload: Dict[str, Any], topic_key: str, scenario_key: str, max_variants: int, max_leaves: int) -> Dict[str, Any]:
     variant_keys = set((catalog_payload.get("variant_by_scenario") or {}).get(scenario_key) or [])
     variants = [v for v in (catalog_payload.get("variants") or []) if v.get("key") in variant_keys]
     variants = variants[:max_variants]
@@ -622,7 +727,17 @@ def _filter_catalog_for_variant_leaf_stage(catalog_payload: Dict[str, Any], scen
     for vk in list(leaf_by_variant.keys()):
         leaf_by_variant[vk] = [lk for lk in leaf_by_variant[vk] if lk in kept_leaf_keys]
 
-    return {"topics": [], "scenarios": [], "variants": variants, "leaves": leaves, "scenario_by_topic": {}, "variant_by_scenario": {scenario_key: kept_variant_keys}, "leaf_by_variant": leaf_by_variant}
+    # The shared prompt requires the chosen topic/scenario to appear in these arrays, so sending
+    # them empty contradicts its own selection rules.
+    return {
+        "topics": [{"key": topic_key, "parent_key": None, "sig": "", "res_sig": ""}] if topic_key else [],
+        "scenarios": [{"key": scenario_key, "parent_key": topic_key or None, "sig": "", "res_sig": ""}],
+        "variants": variants,
+        "leaves": leaves,
+        "scenario_by_topic": {topic_key: [scenario_key]} if topic_key else {},
+        "variant_by_scenario": {scenario_key: kept_variant_keys},
+        "leaf_by_variant": leaf_by_variant,
+    }
 
 
 # ---------------------------------------------------------
@@ -930,6 +1045,7 @@ def bulk_get_or_create_issue_clusters_common(
                     AND ic.product = r.prod
                     AND ic.cluster_level = r.lvl
                     AND ic.cluster_key = r.k
+                    AND (r.lvl = 1 OR ic.parent_cluster_id = r.parent_id)
               );
         END TRY
         BEGIN CATCH
@@ -952,12 +1068,15 @@ def bulk_get_or_create_issue_clusters_common(
          AND ic.product = r.prod
          AND ic.cluster_level = r.lvl
          AND ic.cluster_key = r.k
+         AND (r.lvl = 1 OR ic.parent_cluster_id = r.parent_id)
         WHERE (r.lvl = 1 OR r.parent_id IS NOT NULL)
         ORDER BY r.rownum ASC;
         """,
-        created_by_phase,
-        created_by_phase,
+        # Order must match the ? positions in the SQL text: the @in VALUES rows come
+        # first, then the p2 OUTER APPLY filter, then the INSERT column.
         *params,
+        created_by_phase,
+        created_by_phase,
     )
 
     cols = [c[0] for c in cur.description]
@@ -1042,10 +1161,10 @@ def _select_orphan_threads_for_autocreate(threads: List[Dict[str, Any]], product
         except Exception:
             usefulness_f = 0.0
 
-        if usefulness_f <= _P2E_ORPHAN_USEFULNESS_MIN:
+        if usefulness_f < _P2E_ORPHAN_USEFULNESS_MIN:
             continue
 
-        if status not in ("no_leaf_match", "missing_leaf"):
+        if status not in _P2E_ORPHAN_TRIGGER_STATUSES:
             continue
 
         a = assignments.get(tid) or {}
@@ -1133,7 +1252,7 @@ def process_product_batch(
             return [{"status": "full_validation_failed", "error": msg3, "nano_output": out_full}]
         with sql_connect() as cnx:
             results = _apply_assignments_bulk(cnx, id_by_key, product, threads, by_tid_full)
-            mark_assignment_completed(cnx, [str(t.get("thread_id")) for t in threads])
+            finalize_assignment_batch(cnx, threads, results)
             cnx.commit()
             return results
 
@@ -1168,13 +1287,14 @@ def process_product_batch(
             return [{"status": "full_validation_failed", "error": msg5, "nano_output": out_full}]
         with sql_connect() as cnx:
             results = _apply_assignments_bulk(cnx, id_by_key, product, threads, by_tid_full)
-            mark_assignment_completed(cnx, [str(t.get("thread_id")) for t in threads])
+            finalize_assignment_batch(cnx, threads, results)
             cnx.commit()
             return results
 
     # ---------- Stage C: Variant + Leaf ----------
     for scenario_key, group in by_scenario.items():
-        stage_catalog = _filter_catalog_for_variant_leaf_stage(catalog_payload, scenario_key=scenario_key, max_variants=_P2E_MAX_VARIANTS, max_leaves=_P2E_MAX_LEAVES)
+        topic_key = str(assignments[str(group[0].get("thread_id"))].get("topic_key") or "").strip()
+        stage_catalog = _filter_catalog_for_variant_leaf_stage(catalog_payload, topic_key=topic_key, scenario_key=scenario_key, max_variants=_P2E_MAX_VARIANTS, max_leaves=_P2E_MAX_LEAVES)
         out_full = _call_nano_assign(client, deployment, product, group, stage_catalog, trace_id=trace_id, stage="full")
         ok6, msg6, by_tid_full = validate_batch_assignments(group, out_full)
         if not ok6:
@@ -1198,6 +1318,13 @@ def process_product_batch(
 
             if _P2E_ORPHAN_AUTOCREATE_ENABLED:
                 orphans = _select_orphan_threads_for_autocreate(threads, product, results, assignments)
+                logging.warning(
+                    "[2E:%s] orphan_autocreate candidates=%d statuses=%s usefulness_present=%d/%d",
+                    trace_id, len(orphans),
+                    sorted({str(r.get("status") or "") for r in results}),
+                    sum(1 for t in threads if t.get("solution_usefulness") is not None),
+                    len(threads),
+                )
                 if orphans:
                     logging.warning("[2E:%s] orphan_autocreate start orphans=%d usefulness_min=%.2f", trace_id, len(orphans), _P2E_ORPHAN_USEFULNESS_MIN)
 
@@ -1314,7 +1441,7 @@ def process_product_batch(
                         else:
                             logging.warning("[2E:%s] orphan_autocreate reassignment_failed msg=%s", trace_id, msgr)
 
-            mark_assignment_completed(cnx, [str(t.get("thread_id")) for t in threads])
+            finalize_assignment_batch(cnx, threads, results)
             cnx.commit()
 
             if created_nodes:
@@ -1443,6 +1570,7 @@ def run_phase2e_assign_leaf(req: func.HttpRequest) -> func.HttpResponse:
         # ---- Pre-run diagnostics + cleanup stale claims (common-only) ----
         pre_stats: Dict[str, int] = {}
         with sql_connect() as cnx:
+            ensure_assignment_attempts_column(cnx)
             cleared = clear_stale_assignment_claims(cnx, older_than_minutes=stale_claim_minutes)
 
             cur = cnx.cursor()
@@ -1560,7 +1688,7 @@ def run_phase2e_assign_leaf(req: func.HttpRequest) -> func.HttpResponse:
                 payload = catalog_payload_by_product.get(prod)
                 if not payload:
                     with sql_connect() as cnx:
-                        mark_assignment_completed(cnx, [str(x.get("thread_id")) for x in threads])
+                        record_failed_assignment(cnx, [str(x.get("thread_id")) for x in threads])
                         cnx.commit()
                     all_results.extend([{"thread_id": x.get("thread_id"), "status": "no_catalog_for_product", "product": prod} for x in threads])
                     continue

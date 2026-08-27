@@ -646,6 +646,24 @@ def _build_prompts(
         "## See Also\n"
         "(List 2-4 scenario/variant keys liên quan mà engineer có thể nhầm lẫn. "
         "Format: - [[key]] – cách phân biệt với page này.)\n"
+        "\n"
+        "IMAGES (USE SPARINGLY — AT MOST ONE PER PAGE)\n"
+        "- Only request an image when it clearly helps and the content is genuinely "
+        "complex. Prefer diagrams when the scenario involves >3 interacting components "
+        "or a multi-step flow that is hard to describe in text. Prefer a portal "
+        "screenshot only when a specific blade/tab/fields combination is NOT "
+        "self-explanatory.\n"
+        "- Do NOT request images for simple UIs, single-field settings, or for decoration.\n"
+        "- If requesting an image, embed this EXACT block inline in the markdown at the "
+        "spot it should appear (Phase 4E will generate + splice it in):\n"
+        "<!-- AZURE_IMAGE_REQUEST\n"
+        "kind: diagram | portal_screenshot\n"
+        "caption: <one short line shown under the image>\n"
+        "prompt: <specific prompt for gpt-image-2: for portal screenshots name the "
+        "exact blade/tab/fields and what to highlight; for diagrams list every "
+        "component, labelled arrows (1, 2, 3…), and desired layout>\n"
+        "-->\n"
+        "- The prompt must be self-contained; target <= 1500 characters.\n"
     )
 
     user_prompt = (
@@ -661,6 +679,12 @@ def _build_prompts(
         f"{doc_block if docs else '(none retrieved)'}\n\n"
         "Generate the Markdown scenario guide now."
     )
+
+    try:
+        from product_prompt_addons import append_product_addon as _append_addon
+        system_prompt = _append_addon(system_prompt, product, "phase4c")
+    except Exception:
+        pass
 
     return system_prompt, user_prompt
 
@@ -757,6 +781,11 @@ def _process_single_scenario(
     }
 
     try:
+        if int(scenario.get("member_count") or 0) <= 0:
+            result["status"] = "skipped_zero_members"
+            logging.info("[4C] scenario_id=%d – skipped (zero members)", scenario_id)
+            return result
+
         logging.info("[4C] scenario_id=%d (%s) – gathering context", scenario_id, scenario_key)
         with _sql_connect() as cnx:
             variants = _fetch_variants_for_scenario(cnx, scenario_id)
