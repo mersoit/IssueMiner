@@ -266,7 +266,9 @@ def _fetch_variants_for_scenario(
             v.cluster_key,
             v.cluster_signature_text,
             v.member_count,
-            v.WikiPath            AS wiki_path
+            CASE WHEN v.WikiPath LIKE '/%' AND v.WikiPushedUtc IS NOT NULL
+                      AND LEN(ISNULL(v.WikiContentMarkdown, '')) > 0
+                 THEN v.WikiPath END AS wiki_path
         FROM dbo.issue_cluster v
         WHERE v.parent_cluster_id = ?
           AND v.cluster_level = 3
@@ -283,7 +285,8 @@ def _fetch_variants_for_scenario(
                 l.cluster_key,
                 l.cluster_signature_text,
                 l.member_count,
-                l.WikiPath            AS wiki_path,
+                -- L4 pages come from Phase 3, not issue_cluster.WikiPath.
+                COALESCE(cis.AdoWikiPath, l.WikiPath) AS wiki_path,
                 cis.Title           AS playbook_title,
                 cis.DiagnosticLogicJson AS playbook_diag_json
             FROM dbo.issue_cluster l
@@ -390,26 +393,30 @@ def _mark_scenario_wiki_populated(
 ) -> None:
     cur = cnx.cursor()
     content_hash = hashlib.sha256((markdown or "").encode("utf-8")).hexdigest()
+    # A failed push must not leave a WikiPath behind; parents link from it.
+    pushed = bool(wiki_path) and str(wiki_path).startswith("/")
+    path_val = wiki_path if pushed else None
 
     try:
         cur.execute("""
             UPDATE dbo.issue_cluster
             SET WikiPath = ?,
-                WikiPushedUtc = SYSUTCDATETIME(),
+                WikiPushedUtc = CASE WHEN ? = 1 THEN SYSUTCDATETIME() ELSE NULL END,
                 WikiContentMarkdown = ?,
                 WikiContentHash = ?,
                 WikiModel = ?
             WHERE cluster_id = ?
-        """, wiki_path, markdown, content_hash, model_name, int(scenario_cluster_id))
+        """, path_val, 1 if pushed else 0, markdown, content_hash, model_name,
+             int(scenario_cluster_id))
     except pyodbc.Error as e:
         if "Invalid column name" in str(e):
             try:
                 cur.execute("""
                     UPDATE dbo.issue_cluster
                     SET WikiPath = ?,
-                        WikiPushedUtc = SYSUTCDATETIME()
+                        WikiPushedUtc = CASE WHEN ? = 1 THEN SYSUTCDATETIME() ELSE NULL END
                     WHERE cluster_id = ?
-                """, wiki_path, int(scenario_cluster_id))
+                """, path_val, 1 if pushed else 0, int(scenario_cluster_id))
             except pyodbc.Error:
                 logging.warning(
                     "Wiki columns missing; skipping DB mark for cluster_id=%d",
@@ -834,7 +841,7 @@ def _process_single_scenario(
         with _sql_connect() as cnx:
             wiki_path = _build_scenario_wiki_path(cnx, scenario_id, wiki_root)
             # Resolve [[key]] links to real ADO wiki paths (or plain text if unpublished)
-            md = _resolve_wiki_links(md, cnx)
+            md = _resolve_wiki_links(md, cnx, product)
 
         page = upsert_wiki_page(wiki_id, wiki_path, md)
 

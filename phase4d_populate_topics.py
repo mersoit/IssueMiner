@@ -266,7 +266,9 @@ def _fetch_scenarios_for_topic(
             s.cluster_key,
             s.cluster_signature_text,
             s.member_count,
-            s.WikiPath            AS wiki_path
+            CASE WHEN s.WikiPath LIKE '/%' AND s.WikiPushedUtc IS NOT NULL
+                      AND LEN(ISNULL(s.WikiContentMarkdown, '')) > 0
+                 THEN s.WikiPath END AS wiki_path
         FROM dbo.issue_cluster s
         WHERE s.parent_cluster_id = ?
           AND s.cluster_level = 2
@@ -288,7 +290,9 @@ def _fetch_scenarios_for_topic(
                 v.cluster_key,
                 v.cluster_signature_text,
                 v.member_count,
-                v.WikiPath        AS wiki_path
+                CASE WHEN v.WikiPath LIKE '/%' AND v.WikiPushedUtc IS NOT NULL
+                          AND LEN(ISNULL(v.WikiContentMarkdown, '')) > 0
+                     THEN v.WikiPath END AS wiki_path
             FROM dbo.issue_cluster v
             WHERE v.parent_cluster_id = ?
               AND v.cluster_level = 3
@@ -404,19 +408,23 @@ def _mark_topic_wiki_populated(
     """Persist wiki metadata + content into the SAME issue_cluster row."""
     cur = cnx.cursor()
     content_hash = hashlib.sha256((markdown or "").encode("utf-8")).hexdigest()
+    # A failed push must not leave a WikiPath behind; parents link from it.
+    pushed = bool(wiki_path) and str(wiki_path).startswith("/")
+    path_val = wiki_path if pushed else None
 
     try:
         cur.execute(
             """
             UPDATE dbo.issue_cluster
             SET WikiPath = ?,
-                WikiPushedUtc = SYSUTCDATETIME(),
+                WikiPushedUtc = CASE WHEN ? = 1 THEN SYSUTCDATETIME() ELSE NULL END,
                 WikiContentMarkdown = ?,
                 WikiContentHash = ?,
                 WikiModel = ?
             WHERE cluster_id = ?
             """,
-            wiki_path,
+            path_val,
+            1 if pushed else 0,
             markdown,
             content_hash,
             model_name,
@@ -429,10 +437,11 @@ def _mark_topic_wiki_populated(
                     """
                     UPDATE dbo.issue_cluster
                     SET WikiPath = ?,
-                        WikiPushedUtc = SYSUTCDATETIME()
+                        WikiPushedUtc = CASE WHEN ? = 1 THEN SYSUTCDATETIME() ELSE NULL END
                     WHERE cluster_id = ?
                     """,
-                    wiki_path,
+                    path_val,
+                    1 if pushed else 0,
                     int(topic_cluster_id),
                 )
             except pyodbc.Error:
@@ -818,7 +827,7 @@ def _process_single_topic(
 
         # --- Resolve [[key]] links to real ADO wiki paths ---
         with _sql_connect() as cnx:
-            md = _resolve_wiki_links(md, cnx)
+            md = _resolve_wiki_links(md, cnx, product)
 
         # --- Push to wiki ---
         page = upsert_wiki_page(wiki_id, wiki_path, md)

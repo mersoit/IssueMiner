@@ -263,7 +263,9 @@ def _fetch_leaves_for_variant(cnx: pyodbc.Connection, variant_cluster_id: int) -
             l.resolution_signature_text,
             l.member_count,
             l.max_solution_usefulness,
-            l.WikiPath            AS wiki_path,
+            -- L4 pages are published by Phase 3 into CommonIssueSolutions, so
+            -- issue_cluster.WikiPath is never set for a leaf.
+            COALESCE(cis.AdoWikiPath, l.WikiPath) AS wiki_path,
             cis.Title           AS playbook_title,
             cis.ProblemStatement AS playbook_problem,
             cis.DiagnosticLogicJson AS playbook_diag_json
@@ -318,20 +320,29 @@ def _mark_variant_wiki_populated(
     markdown: str,
     model_name: str,
 ) -> None:
-    """Persist wiki metadata + content into the SAME issue_cluster row."""
+    """Persist wiki metadata + content into the SAME issue_cluster row.
+
+    A failed push must NOT leave a WikiPath or WikiPushedUtc behind: parent pages
+    resolve [[key]] links from those columns, so a sentinel like "push_failed"
+    turns into a link to a page that does not exist. Content is still saved so a
+    later retry can push it without regenerating.
+    """
     cur = cnx.cursor()
     content_hash = hashlib.sha256((markdown or "").encode("utf-8")).hexdigest()
+    pushed = bool(wiki_path) and str(wiki_path).startswith("/")
+    path_val = wiki_path if pushed else None
 
     try:
         cur.execute("""
             UPDATE dbo.issue_cluster
             SET WikiPath = ?,
-                WikiPushedUtc = SYSUTCDATETIME(),
+                WikiPushedUtc = CASE WHEN ? = 1 THEN SYSUTCDATETIME() ELSE NULL END,
                 WikiContentMarkdown = ?,
                 WikiContentHash = ?,
                 WikiModel = ?
             WHERE cluster_id = ?
-        """, wiki_path, markdown, content_hash, model_name, int(variant_cluster_id))
+        """, path_val, 1 if pushed else 0, markdown, content_hash, model_name,
+             int(variant_cluster_id))
     except pyodbc.Error as e:
         if "Invalid column name" in str(e):
             # Support partial migrations. Try minimum update.
@@ -339,9 +350,9 @@ def _mark_variant_wiki_populated(
                 cur.execute("""
                     UPDATE dbo.issue_cluster
                     SET WikiPath = ?,
-                        WikiPushedUtc = SYSUTCDATETIME()
+                        WikiPushedUtc = CASE WHEN ? = 1 THEN SYSUTCDATETIME() ELSE NULL END
                     WHERE cluster_id = ?
-                """, wiki_path, int(variant_cluster_id))
+                """, path_val, 1 if pushed else 0, int(variant_cluster_id))
             except pyodbc.Error:
                 logging.warning(
                     "Wiki columns missing; skipping DB mark for cluster_id=%d",
@@ -388,29 +399,39 @@ def _wiki_page_url(wiki_path: str) -> str:
     )
 
 
-def _resolve_wiki_links(md: str, cnx: pyodbc.Connection) -> str:
+def _resolve_wiki_links(md: str, cnx: pyodbc.Connection, product: Optional[str] = None) -> str:
     """
     Convert all [[cluster-key]] wiki-link tokens in generated Markdown
     to proper ADO Wiki hyperlinks or plain text.
 
-    Rules:
-    - [[key]] where cluster has WikiPath  -> [key](full_ado_wiki_url)
-    - [[key]] where cluster has no WikiPath -> plain `key` (no broken link)
-    - [[display|key]] same logic, key for lookup, display for label
+    A key is only linked when the target page is genuinely published: a real
+    path, a push timestamp, and non-empty content. A node can exist in the
+    catalog without ever reaching the wiki, and linking those produces dead
+    links. `product` scopes the lookup because cluster_key is not unique across
+    products at the same level.
     """
     keys = set(re.findall(r'\[\[(?:[^|\]]+\|)?([^\]]+)\]\]', md))
     if not keys:
         return md
 
-    # Batch-lookup WikiPath for all referenced keys
     path_map: Dict[str, Optional[str]] = {}
     cur = cnx.cursor()
     placeholders = ",".join("?" for _ in keys)
+    args: List[Any] = list(keys)
+    prod_filter = ""
+    if product:
+        prod_filter = " AND product = ?"
+        args.append(product)
     try:
         cur.execute(
-            f"SELECT cluster_key, WikiPath FROM dbo.issue_cluster "
-            f"WHERE cluster_key IN ({placeholders}) AND is_active = 1",
-            *keys,
+            f"""SELECT cluster_key, WikiPath FROM dbo.issue_cluster
+                WHERE cluster_key IN ({placeholders})
+                  AND is_active = 1
+                  AND WikiPath LIKE '/%'
+                  AND WikiPushedUtc IS NOT NULL
+                  AND LEN(ISNULL(WikiContentMarkdown, '')) > 0
+                  {prod_filter}""",
+            *args,
         )
         for row in cur.fetchall():
             path_map[str(row[0])] = row[1] or None
@@ -718,7 +739,7 @@ def _process_single_variant(
 
         # --- Resolve [[key]] links to real ADO wiki paths ---
         with _sql_connect() as cnx:
-            md = _resolve_wiki_links(md, cnx)
+            md = _resolve_wiki_links(md, cnx, product)
 
         # --- Push to wiki ---
         with _sql_connect() as cnx:
