@@ -28,7 +28,8 @@ def _get_connection_string() -> str:
 
 
 def sql_connect() -> pyodbc.Connection:
-    return pyodbc.connect(_get_connection_string(), timeout=30)
+    from sql_helpers import sql_connect as _shared
+    return _shared()
 
 
 # ─────────────────────────────────────────────────────────

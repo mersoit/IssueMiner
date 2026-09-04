@@ -1,6 +1,10 @@
 import os
 import json
 import logging
+import re
+import struct
+import subprocess
+import threading
 import time
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
@@ -13,13 +17,78 @@ _CONNECT_RETRIES = int(os.getenv("SQL_CONNECT_RETRIES", "5"))
 _CONNECT_BACKOFF = float(os.getenv("SQL_CONNECT_BACKOFF", "15"))
 _RESUME_SQLSTATES = ("08001", "08S01", "40613", "HYT00", "HY000")
 
+# ODBC access-token attribute (SQL_COPT_SS_ACCESS_TOKEN).
+_SQL_COPT_SS_ACCESS_TOKEN = 1256
+_AUTH_RE = re.compile(r"Authentication=[^;]*;?", re.I)
+_CRED_RE = re.compile(r"(UID|PWD|User ID|Password)=[^;]*;?", re.I)
+
+_token_cache: Dict[str, Any] = {"value": None, "expires": 0.0}
+_token_lock = threading.Lock()
+
+
+def _cli_access_token() -> str:
+    """Fetch a SQL access token from the Azure CLI, pinned to a subscription.
+
+    Interactive/Default ODBC auth picks up whichever tenant the CLI happens to
+    default to, which is not necessarily the one owning the database. Pinning the
+    subscription keeps this deterministic and works without a UI prompt.
+    """
+    with _token_lock:
+        if _token_cache["value"] and time.time() < _token_cache["expires"]:
+            return _token_cache["value"]
+
+        sub = os.getenv("SQL_TOKEN_SUBSCRIPTION", "").strip()
+        cmd = ["az", "account", "get-access-token",
+               "--resource", "https://database.windows.net/",
+               "--query", "accessToken", "-o", "tsv"]
+        if sub:
+            cmd += ["--subscription", sub]
+        out = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        token = (out.stdout or "").strip()
+        if not token:
+            raise RuntimeError(
+                "SQL_USE_CLI_TOKEN is set but 'az account get-access-token' returned "
+                f"nothing. Run 'az login'. stderr: {(out.stderr or '').strip()[:300]}"
+            )
+        _token_cache["value"] = token
+        _token_cache["expires"] = time.time() + 1800
+        return token
+
+
+def get_connection_string() -> str:
+    """Env first, then local.settings.json so modules also work run standalone."""
+    cs = os.environ.get("SQL_CONNECTION_STRING")
+    if cs:
+        return cs
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local.settings.json")
+        with open(p, "r", encoding="utf-8-sig") as f:
+            cs = json.load(f).get("Values", {}).get("SQL_CONNECTION_STRING")
+        if cs:
+            return cs
+    except Exception:
+        pass
+    raise KeyError("SQL_CONNECTION_STRING")
+
+
+def _connect_args() -> Tuple[str, Dict[str, Any]]:
+    cs = get_connection_string()
+    if os.getenv("SQL_USE_CLI_TOKEN", "0") != "1":
+        return cs, {}
+
+    # An access token cannot be combined with Authentication= or UID/PWD.
+    cleaned = _CRED_RE.sub("", _AUTH_RE.sub("", cs))
+    raw = _cli_access_token().encode("utf-16-le")
+    packed = struct.pack(f"<I{len(raw)}s", len(raw), raw)
+    return cleaned, {"attrs_before": {_SQL_COPT_SS_ACCESS_TOKEN: packed}}
+
 
 def sql_connect() -> pyodbc.Connection:
-    cs = os.environ["SQL_CONNECTION_STRING"]
     last: Optional[Exception] = None
     for attempt in range(1, _CONNECT_RETRIES + 1):
+        cs, kwargs = _connect_args()
         try:
-            return pyodbc.connect(cs)
+            return pyodbc.connect(cs, **kwargs)
         except pyodbc.Error as exc:
             last = exc
             state = exc.args[0] if exc.args else ""

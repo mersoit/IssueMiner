@@ -807,27 +807,12 @@ _DEFAULT_ANTHROPIC_TPM = int(os.getenv("AOAI_ANTHROPIC_TPM_LIMIT", "900000"))
 # ─────────────────────────────────────────────────────────
 
 def sql_connect(autocommit: bool = False) -> pyodbc.Connection:
-    cs = os.environ["SQL_CONNECTION_STRING"]
-    timeout = int(os.getenv("SQL_CONNECT_TIMEOUT", "30"))
-    # A serverless database that has auto-paused rejects logins until it resumes (~1 min).
-    retries = int(os.getenv("SQL_CONNECT_RETRIES", "5"))
-    backoff = float(os.getenv("SQL_CONNECT_BACKOFF", "15"))
-    resume_states = ("08001", "08S01", "40613", "HYT00", "HY000")
-    for attempt in range(1, retries + 1):
-        try:
-            cnx = pyodbc.connect(cs, timeout=timeout)
-            cnx.autocommit = autocommit
-            return cnx
-        except pyodbc.Error as exc:
-            state = exc.args[0] if exc.args else ""
-            if state not in resume_states or attempt == retries:
-                raise
-            wait = backoff * attempt
-            logging.warning(
-                "[sql] connect failed (%s) attempt %d/%d — database may be resuming; retrying in %.0fs",
-                state, attempt, retries, wait,
-            )
-            time.sleep(wait)
+    # Delegate so both entry points share one auth path (including CLI-token mode).
+    from sql_helpers import sql_connect as _shared_connect
+
+    cnx = _shared_connect()
+    cnx.autocommit = autocommit
+    return cnx
     raise RuntimeError("unreachable")
 
 

@@ -59,7 +59,8 @@ _MAX_SCENARIOS_IN_PROMPT = int(os.getenv("PHASE4D_MAX_SCENARIOS", "20"))
 # ---------------------------------------------------------
 
 def _sql_connect() -> pyodbc.Connection:
-    return pyodbc.connect(os.environ["SQL_CONNECTION_STRING"], timeout=45)
+    from sql_helpers import sql_connect as _shared
+    return _shared()
 
 
 def _make_gpt52_client() -> AzureOpenAI:

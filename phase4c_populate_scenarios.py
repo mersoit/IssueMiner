@@ -73,7 +73,8 @@ _DEFAULT_MODEL = os.getenv("PHASE4C_MODEL", "gpt52").strip().lower()
 # ---------------------------------------------------------
 
 def _sql_connect() -> pyodbc.Connection:
-    return pyodbc.connect(os.environ["SQL_CONNECTION_STRING"], timeout=45)
+    from sql_helpers import sql_connect as _shared
+    return _shared()
 
 
 def _slug(s: str) -> str:

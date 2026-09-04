@@ -148,17 +148,8 @@ def ensure_table(cnx: pyodbc.Connection) -> None:
 
 
 def _sql_connect() -> pyodbc.Connection:
-    cs = os.environ.get("SQL_CONNECTION_STRING")
-    if not cs:
-        try:
-            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local.settings.json")
-            with open(p, "r", encoding="utf-8-sig") as f:
-                cs = json.load(f).get("Values", {}).get("SQL_CONNECTION_STRING")
-        except Exception:
-            pass
-    if not cs:
-        raise RuntimeError("SQL_CONNECTION_STRING not found")
-    return pyodbc.connect(cs, timeout=30)
+    from sql_helpers import sql_connect as _shared
+    return _shared()
 
 
 # ---------------------------------------------------------------------------
